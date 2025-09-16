@@ -296,7 +296,14 @@ if run:
                            mime="application/zip")
 
         st.markdown("### Previews")
-        cols = st.columns(3)
-        for idx, (fname, data_bytes) in enumerate(thumbs):
-            with cols[idx % 3]:
-                st.image(data_bytes, caption=fname, use_container_width=True)
+cols = st.columns(3)
+for idx, (fname, data_bytes) in enumerate(thumbs):
+    with cols[idx % 3]:
+        st.image(data_bytes, caption=fname, use_container_width=True)
+        st.download_button(
+            "Download",
+            data=data_bytes,
+            file_name=fname,
+            mime="image/webp",
+            key=f"dl_{idx}"   # unique key so Streamlit renders all buttons
+        )
