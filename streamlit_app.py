@@ -1,27 +1,30 @@
+# streamlit_app.py
 import base64
-import os, io, re, time, zipfile, requests
+import os, io, re, time, zipfile, requests, random
 from typing import List
 from PIL import Image
 import streamlit as st
 
+# -------------------- App setup --------------------
 st.set_page_config(page_title="Bulk Blog Image Generator", layout="wide")
 
-# Optional simple team password gate. Leave "" to disable or set via Secrets.
-APP_PASSWORD = st.secrets.get("APP_PASSWORD", "")
+# Optional simple team password (set in Secrets -> APP_PASSWORD or hardcode here)
+APP_PASSWORD = st.secrets.get("APP_PASSWORD", "")  # "" disables the gate
 
 SITE_PROFILES = {
     "vailvacay.com":  "Photorealistic alpine resort & village scenes in the Colorado Rockies; ski terrain; evergreen forests; cozy lodges; no text.",
     "bangkokvacay.com":"Photorealistic Southeast Asian city scenes; temples, canals, street food markets, tuk-tuks; golden-hour light; no text.",
-    "bostonvacay.com": "Photorealistic New England city imagery; brick townhouses, harbor, fall foliage, cobblestones; no text.",
+    "bostonvacay.com": "Photorealistic New England city imagery; Beacon Hill brick townhouses, harbor, Charles River, fall foliage; no text.",
     "ipetzo.com":      "Photorealistic pet lifestyle images; dogs/cats with owners outdoors/indoors; neutral interiors/parks; no brands; no text.",
     "1-800deals.com":  "Photorealistic retail/ecommerce visuals; shopping scenes, parcels, generic products; clean backgrounds; no brands; no text.",
 }
 DEFAULT_SITE = "vailvacay.com"
+
 API_IMAGE_SIZE = "1536x1024"      # Supported: 1024x1024, 1024x1536, 1536x1024, or "auto"
-OUTPUT_W, OUTPUT_H = 1200, 675    # final blog size
+OUTPUT_W, OUTPUT_H = 1200, 675    # Final blog size
 DEFAULT_QUALITY = 82              # WebP quality (70–82 is good)
 
-# ---------- helpers ----------
+# -------------------- Helpers --------------------
 def slugify(text: str) -> str:
     t = text.lower().strip()
     t = re.sub(r"[’'`]", "", t)
@@ -47,31 +50,180 @@ def save_webp_bytes(img: Image.Image, w: int, h: int, quality: int) -> bytes:
     img.save(buf, "WEBP", quality=quality, method=6)
     return buf.getvalue()
 
+# ====== UNIVERSAL SMART PROMPT PLANNER ======
+def detect_season(keyword: str) -> str:
+    k = keyword.lower()
+    if any(w in k for w in ["winter", "snow", "dec", "jan", "feb"]): return "winter"
+    if any(w in k for w in ["fall", "autumn", "sept", "oct", "nov", "foliage"]): return "fall"
+    if any(w in k for w in ["spring", "apr", "may", "wildflower"]): return "spring"
+    if any(w in k for w in ["summer", "jun", "jul", "aug", "lake", "river", "hike", "paddle", "raft"]): return "summer"
+    return "auto"
+
+def season_descriptors(season: str) -> str:
+    return {
+        "winter": "fresh snow, crisp air, low winter sun; conifers frosted",
+        "summer": "lush greens, clear sky, warm light; water activity possible",
+        "fall":   "golden foliage, warm sidelight, long shadows",
+        "spring": "snowmelt, budding trees, bright fresh greens",
+        "auto":   "seasonally-appropriate light and foliage"
+    }[season]
+
+def composition_hint() -> str:
+    return ("Composition: strong foreground interest, clear midground subject, layered background; "
+            "eye-level camera, 24–35mm FoV, gentle leading lines from a path/road/water.")
+
+def negatives(site: str) -> str:
+    common = "No typography overlay; avoid readable signs or brand logos."
+    if site == "1-800deals.com":
+        return common + " Packaging must be generic with blank labels; avoid trademarks/SKUs/barcodes."
+    if site == "ipetzo.com":
+        return common + " No harmful gear or unsafe handling."
+    return common
+
+def classify(keyword: str) -> set:
+    k = keyword.lower()
+    tags = set()
+    if "things to do" in k: tags.add("todo")
+    if any(w in k for w in ["how far", "distance", "drive", "get to", "directions"]): tags.add("drive")
+    if any(w in k for w in ["where to stay", "hotel", "lodging", "resort"]): tags.add("hotel")
+    if any(w in k for w in ["hike", "trail"]): tags.add("hike")
+    if any(w in k for w in ["baby", "family", "stroller", "non-skiers", "don't ski", "don’t ski"]): tags.add("family")
+    if "cigar" in k: tags.add("cigar")
+    if any(w in k for w in ["compare", "compared to"]): tags.add("compare")
+    if "between" in k and "vail" in k and "denver" in k: tags.add("between_vail_denver")
+    # Pet-site specific intents
+    if any(w in k for w in ["groom", "grooming", "bath"]): tags.add("grooming")
+    if any(w in k for w in ["train", "obedience", "recall"]): tags.add("training")
+    if any(w in k for w in ["vet", "clinic", "checkup"]): tags.add("vet")
+    if any(w in k for w in ["travel", "car", "hotel", "carrier", "flight"]): tags.add("pet_travel")
+    if any(w in k for w in ["cat", "kitten"]): tags.add("cat")
+    if any(w in k for w in ["dog", "puppy"]): tags.add("dog")
+    # Retail intents
+    if any(w in k for w in ["deals", "coupon", "sale", "shopping", "checkout", "unboxing", "parcel"]):
+        tags.add("retail")
+    return tags
+
+def choose_one(options): return random.choice(options)
+
+def geo_enrichment(site: str, keyword: str, season: str, tags: set) -> str:
+    s = site.lower()
+
+    # ----- Vail Vacay -----
+    if s == "vailvacay.com":
+        if "between_vail_denver" in tags:
+            winter = [
+                "Loveland Pass overlook with winding US-6 switchbacks and Continental Divide peaks",
+                "Georgetown Loop Railroad crossing a steel trestle over a snowy pine valley",
+                "Idaho Springs historic main street with light snow and steam from hot springs area",
+                "Dillon Reservoir shoreline with frozen lake activities and Tenmile Range backdrop",
+            ]
+            summer = [
+                "Red Rocks Park approach with sandstone fins and foothills at golden hour",
+                "Dillon Reservoir boardwalk with kayaks and the Tenmile Range behind",
+                "Georgetown Loop Railroad on a trestle over pine valley in summer greens",
+                "Idaho Springs main street with Victorian brick storefronts and foothills",
+            ]
+            return choose_one(winter if season == "winter" else summer)
+        if "drive" in tags:
+            return "scenic I-70 mountain approach framed by evergreens and peaks; safe roadside vantage"
+        if "hotel" in tags:
+            return "inviting alpine-style hotel exterior at dusk with warm window glow and mountains behind"
+        if "hike" in tags or "family" in tags:
+            return "easy riverside path or lakeside trail with families; aspens and peaks around"
+        if "cigar" in tags:
+            return "cozy upscale lounge interior with leather chairs and warm ambient light"
+        return "place-relevant alpine hero scene showing mountains, forest, and village context"
+
+    # ----- Bangkok Vacay -----
+    if s == "bangkokvacay.com":
+        if "todo" in tags:
+            return choose_one([
+                "floating market with boats of fruit and flowers on a canal",
+                "Wat Arun riverside view at golden hour with a long-tail boat passing",
+                "Chinatown night street food scene with steam and neon ambience (no readable signs)",
+                "Tuk-tuk on a lively old-town street near temples and palms",
+            ])
+        if "drive" in tags:
+            return "riverfront arterial with skyline glimpse and long-tail boat; warm sunset"
+        return choose_one([
+            "temple courtyard with ornate roofs and palms",
+            "canal scene with wooden houses and boats",
+            "night market with colorful stalls and crowds (blurred, no readable text)"
+        ])
+
+    # ----- Boston Vacay -----
+    if s == "bostonvacay.com":
+        if "todo" in tags:
+            return choose_one([
+                "Beacon Hill brownstones with gas lamps and brick sidewalks",
+                "Boston Public Garden footbridge with swan boats",
+                "Charles River Esplanade with runners and sailboats on the water",
+                "Harborwalk with skyline across the harbor at golden hour",
+            ])
+        if "drive" in tags:
+            return "riverside vista along Storrow Drive with Charles River and skyline beyond"
+        if "hotel" in tags:
+            return "classic Back Bay hotel facade at golden hour with city skyline hints"
+        if "hike" in tags or "family" in tags:
+            return "Emerald Necklace park path with families and strollers under leafy trees"
+        return choose_one([
+            "cobblestone lane with historic brick facades",
+            "harbor marina with boats and skyline",
+            "leafy neighborhood street with historical character"
+        ])
+
+    # ----- iPetzo (pets) -----
+    if s == "ipetzo.com":
+        if "grooming" in tags:
+            return "bright grooming salon scene with a dog being trimmed on a table; tidy tools; no branding"
+        if "training" in tags:
+            return "obedience training in a park; handler rewarding a dog with treats; correct leash handling"
+        if "vet" in tags:
+            return "modern vet clinic exam room; vet gently checking a pet; clean, unbranded space"
+        if "pet_travel" in tags:
+            return "pet-friendly hotel room or car with a safely harnessed dog; travel gear without logos"
+        if "cat" in tags:
+            return "sunny living-room window light with a cat on a couch or cat tree; tasteful minimal decor"
+        # default dogs/pets lifestyle
+        return "owners walking a dog on a leafy path or city park; friendly mood; neutral collars with no logos"
+
+    # ----- 1-800deals (retail) -----
+    if s == "1-800deals.com":
+        if "retail" in tags or "todo" in tags:
+            return choose_one([
+                "unboxing scene on a clean table with plain cardboard box and tissue paper (no logos or text)",
+                "shopping cart close-up in a bright generic store aisle with abstract products (no logos)",
+                "parcel stack at a doorstep with neutral labels and tape (no branding)",
+                "hands at a generic checkout counter scanning a plain box (no readable screens/text)",
+            ])
+        return "generic ecommerce product lifestyle scene with plain packaging and soft studio light"
+
+    # ----- Fallback for unknown sites -----
+    return "place-appropriate hero scene that fits the topic and feels specific to the region or niche"
+
 def build_prompt(site: str, keyword: str) -> str:
     base = SITE_PROFILES.get(site, SITE_PROFILES[DEFAULT_SITE])
-    k = keyword.lower(); style_hints = []
-    if any(x in k for x in ["how far","get to","how to get","directions","from avon","from colorado springs"]):
-        style_hints.append("scenic travel approach or roadway vantage; safe roadside view; vehicles optional")
-    if any(x in k for x in ["back bowls","snow","open","ski"]):
-        style_hints.append("wide landscape vista that fits the topic; seasonally appropriate terrain")
-    if any(x in k for x in ["where to stay","hotel review","hotel"]):
-        style_hints.append("inviting lodging exterior or interior; golden-hour or dusk; warm light")
-    if "cigar" in k:
-        style_hints.append("cozy upscale lounge interior; leather seating; warm ambient light; no branding")
-    if any(x in k for x in ["don't ski","don’t ski","non-skiers","baby-friendly","where to hike"]):
-        style_hints.append("walkable areas or easy trails; friendly human presence; relaxed mood")
-    if any(x in k for x in ["what county","what river","what mountain range","when was","when did","how corporate"]):
-        style_hints.append("documentary/editorial feel emphasizing place over people")
-    if "celebrities" in k:
-        style_hints.append("privacy-respecting generic high-end neighborhood; no identifiable faces")
-    if "how to dress" in k:
-        style_hints.append("tasteful street-style outfit details; no visible logos")
-    if any(x in k for x in ["beaver creek","compared to vail"]):
-        style_hints.append("neutral comparative vibe; tasteful resort scenery")
-    style = ", ".join(style_hints) if style_hints else "scene appropriate to the topic"
-    return (f"{base} Balanced composition; natural light; editorial stock-photo feel. "
-            f"Create an image for the topic: '{keyword}'. Landscape orientation. No words or typography anywhere. "
-            f"Scene intent: {style}.")
+    season = detect_season(keyword)
+    season_words = season_descriptors(season)
+    tags = classify(keyword)
+    scene = geo_enrichment(site, keyword, season, tags)
+    comp = composition_hint()
+    neg = negatives(site)
+    photo_salt = random.choice([
+        "documentary travel photo, natural color",
+        "editorial stock photo, soft contrast",
+        "RAW-like realism, accurate white balance",
+        "crisp air clarity, minimal haze"
+    ])
+    people_hint = "subtle human presence for scale, people small in frame" if "todo" in tags else "people optional"
+
+    return (
+        f"{base} {photo_salt}. {comp} {neg} "
+        f"Season cues: {season_words}. {people_hint}. "
+        f"Keyword: '{keyword}'. Depict specifically: {scene}. "
+        f"Landscape orientation only. No words or typography anywhere."
+    )
+# ====== END UNIVERSAL SMART PROMPT PLANNER ======
 
 def dalle_generate_image_bytes(prompt: str, size: str, api_key: str) -> bytes:
     """
@@ -93,9 +245,9 @@ def dalle_generate_image_bytes(prompt: str, size: str, api_key: str) -> bytes:
         return resp.content
     raise RuntimeError("Images API returned neither b64_json nor url")
 
-# ---------- UI ----------
+# -------------------- UI --------------------
 st.title("Bulk Blog Image Generator (1200×675 WebP)")
-st.caption("Paste keywords (one per line). Generates DALL·E images, crops to 1200×675, then bundles a ZIP.")
+st.caption("Paste keywords (one per line). Generates DALL·E images, crops to 1200×675, and bundles a ZIP.")
 
 # Optional password gate
 if APP_PASSWORD:
@@ -110,11 +262,12 @@ with st.sidebar:
     size = st.selectbox("DALL·E render size", ["1536x1024","1024x1536","1024x1024"], index=0)
 
 keywords_text = st.text_area(
-    "Keywords (one per line)", height=240,
-    placeholder="Where to Stay in Vail\nWhat County is Vail Colorado in\nWhen Do Vail Back Bowls Open"
+    "Keywords (one per line)",
+    height=240,
+    placeholder="Where to Stay in Vail\nThings To Do Between Vail and Denver\nDog Grooming Tips\nBest Deals on Kitchen Gadgets"
 )
 user_api_key = st.text_input("Enter your OpenAI API key", type="password",
-                             help="Each user can use their own key.")
+                             help="Each user can use their own key (recommended).")
 
 col1, col2 = st.columns([1,1])
 run_btn = col1.button("Generate Images")
@@ -154,13 +307,14 @@ if run_btn:
             successes += 1
         except Exception as e:
             st.error(f"{kw}: {e}")
+
         progress.progress(i / len(keywords))
 
     zipf.close()
     zip_buf.seek(0)
 
     if successes == 0:
-        st.error("No images were generated. Check your API key or try a single keyword.")
+        st.error("No images were generated. Check your API key and try again with 1–2 keywords.")
     else:
         st.success("Done! Download your images below.")
         st.download_button("⬇️ Download ZIP", data=zip_buf,
