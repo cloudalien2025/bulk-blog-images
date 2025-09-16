@@ -1,3 +1,7 @@
+# VacayForge Autopilot v1.0.0
+# Bulk, plug-and-play blog images with per-image downloads + ZIP export.
+# Requirements: streamlit, requests, pillow
+
 import base64
 import io
 import random
@@ -10,9 +14,12 @@ from PIL import Image
 import streamlit as st
 
 # ==============================
-# App config
+# App identity & config
 # ==============================
-st.set_page_config(page_title="Bulk Blog Image Generator — Autopilot", layout="wide")
+APP_NAME = "VacayForge Autopilot"
+APP_VERSION = "v1.0.0"
+
+st.set_page_config(page_title=f"{APP_NAME} — {APP_VERSION}", layout="wide")
 
 # Optional: put APP_PASSWORD or OPENAI_API_KEY in Streamlit Secrets
 APP_PASSWORD = st.secrets.get("APP_PASSWORD", "")
@@ -26,9 +33,8 @@ SITE_PRESETS = {
     "1-800deals.com":  "Retail/e-commerce visuals; parcels, unboxing, generic products; clean backgrounds; photorealistic; no brands; no text.",
 }
 
-# Render size supported by OpenAI Images API
-API_IMAGE_SIZE = "1536x1024"     # also supports 1024x1024, 1024x1536
-OUTPUT_W, OUTPUT_H = 1200, 675   # blog target
+API_IMAGE_SIZE = "1536x1024"     # Supported: 1024x1024, 1024x1536, 1536x1024
+OUTPUT_W, OUTPUT_H = 1200, 675   # Blog target
 DEFAULT_QUALITY = 82
 
 # ==============================
@@ -63,7 +69,7 @@ def to_webp_bytes(img: Image.Image, w: int, h: int, quality: int) -> bytes:
 # Prompt planner — Autopilot
 # ==============================
 def site_negatives(site: str) -> str:
-    common = "No text or typography overlay; avoid readable signs and logos; privacy-respecting; non-explicit."
+    common = "No text or typography overlay; avoid readable signs/logos; privacy-respecting; non-explicit."
     if site == "1-800deals.com":
         return common + " Packaging must be generic with blank labels; avoid trademarks/SKUs/barcodes."
     if site == "ipetzo.com":
@@ -90,8 +96,8 @@ def season_hint(keyword: str) -> str:
 
 def subject_cues(keyword: str) -> Tuple[List[str], List[str]]:
     """
-    Returns (cues, stronger_refine_cues).
-    A tiny, universal cue list to keep topics obvious.
+    Returns (soft_cues, strong_refine_cues).
+    Minimal universal cues so results scream the topic.
     """
     k = keyword.lower()
     cues, strong = [], []
@@ -139,19 +145,18 @@ def build_prompt(site: str, keyword: str, variation: str = "") -> Tuple[str, Lis
     negs = site_negatives(site)
     cues, strong = subject_cues(keyword)
 
-    composition = ("balanced composition, natural light, editorial stock-photo feel; "
-                   "clear foreground subject and layered background; landscape orientation.")
+    composition = (
+        "balanced composition, natural light, editorial stock-photo feel; "
+        "clear foreground subject and layered background; landscape orientation."
+    )
     season = season_hint(keyword)
 
     chips = [composition, season, negs]
     if variation:
         chips.append(variation)
 
-    # Primary brief (one sentence + chips + cues)
-    core = (
-        f"Create a photorealistic travel blog image for: '{keyword}'. "
-        f"Site vibe: {base} "
-    )
+    # Primary brief (one crisp sentence + chips + soft cues)
+    core = f"Create a photorealistic travel blog image for: '{keyword}'. Site vibe: {base} "
     if cues:
         core += "Include clear visual cues: " + "; ".join(cues) + ". "
 
@@ -165,7 +170,7 @@ def refine_prompt(original_prompt: str, strong_cues: List[str]) -> str:
 
 def dalle_image_bytes(prompt: str, size: str, api_key: str) -> bytes:
     """
-    Call OpenAI Images API (gpt-image-1). If base64 is returned, decode; else fetch from URL.
+    Call OpenAI Images API (gpt-image-1). Decode base64 if present, else fetch URL.
     """
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     payload = {"model": "gpt-image-1", "prompt": prompt, "size": size}
@@ -186,8 +191,9 @@ def dalle_image_bytes(prompt: str, size: str, api_key: str) -> bytes:
 # ==============================
 # UI — minimal Autopilot
 # ==============================
-st.title("Bulk Blog Image Generator — Autopilot")
-st.caption("Paste keywords (one per line), choose a site, generate. The app plans a brief per keyword, adds subject cues, and outputs 1200×675 WebP images.")
+st.title(f"{APP_NAME} — {APP_VERSION}")
+st.caption("Paste keywords (one per line), choose a site, click Generate. The app plans a brief per keyword, "
+           "adds subject cues, and outputs 1200×675 WebP images with per-image downloads + a ZIP file.")
 
 if APP_PASSWORD:
     gate = st.text_input("Team password", type="password")
@@ -200,7 +206,6 @@ with st.sidebar:
     quality = st.slider("WebP quality", 60, 95, DEFAULT_QUALITY)
     size = st.selectbox("Render size", ["1536x1024", "1024x1024", "1024x1536"], index=0)
 
-    # Advanced (optional) — still fully autopilot
     with st.expander("Advanced (optional)"):
         variations = [
             "",  # none
@@ -213,9 +218,12 @@ with st.sidebar:
         ]
         variation_choice = st.selectbox("Global vibe tweak", variations, index=0)
 
-openai_key = st.text_input("OpenAI API key", type="password",
-                           value=st.secrets.get("OPENAI_API_KEY", ""),
-                           help="Stored securely in your browser session. You can also set OPENAI_API_KEY in Streamlit Secrets.")
+openai_key = st.text_input(
+    "OpenAI API key",
+    type="password",
+    value=st.secrets.get("OPENAI_API_KEY", ""),
+    help="You can also set OPENAI_API_KEY in Streamlit Secrets."
+)
 
 keywords_text = st.text_area(
     "Keywords (one per line)",
@@ -235,7 +243,7 @@ if col2.button("Clear"):
     st.experimental_rerun()
 
 # ==============================
-# Run — batch, one image per keyword, auto-refine once for cue-heavy topics
+# Run — batch (1 image per keyword), auto-refine once if cues exist
 # ==============================
 if run:
     if not openai_key:
@@ -259,20 +267,19 @@ if run:
         try:
             status.text(f"Generating {i}/{len(keywords)}: {kw}")
 
-            # First pass prompt
+            # First pass
             prompt, strong_cues = build_prompt(site, kw, variation_choice)
             png_bytes = dalle_image_bytes(prompt, size, openai_key)
             img = Image.open(io.BytesIO(png_bytes))
 
-            # Simple auto-refine pass for cue-heavy topics (do once, unconditionally if cues exist)
+            # Auto-refine once if there are strong cues
             if strong_cues:
                 try:
                     refined = refine_prompt(prompt, strong_cues)
                     png_bytes2 = dalle_image_bytes(refined, size, openai_key)
                     img = Image.open(io.BytesIO(png_bytes2))
                 except Exception:
-                    # keep first image if refine fails
-                    pass
+                    pass  # keep first image if refine fails
 
             webp = to_webp_bytes(img, OUTPUT_W, OUTPUT_H, quality)
             zipf.writestr(f"{slug}.webp", webp)
@@ -291,19 +298,23 @@ if run:
         st.error("No images were generated. Check your API key and try again with 1–2 keywords.")
     else:
         st.success("Done! Download your images below.")
-        st.download_button("⬇️ Download ZIP", data=zip_buf,
-                           file_name=f"{slugify(site)}_images.zip",
-                           mime="application/zip")
+        st.download_button(
+            "⬇️ Download ZIP",
+            data=zip_buf,
+            file_name=f"{slugify(site)}_images.zip",
+            mime="application/zip",
+            key="zip_dl"
+        )
 
         st.markdown("### Previews")
-cols = st.columns(3)
-for idx, (fname, data_bytes) in enumerate(thumbs):
-    with cols[idx % 3]:
-        st.image(data_bytes, caption=fname, use_container_width=True)
-        st.download_button(
-            "Download",
-            data=data_bytes,
-            file_name=fname,
-            mime="image/webp",
-            key=f"dl_{idx}"   # unique key so Streamlit renders all buttons
-        )
+        cols = st.columns(3)
+        for idx, (fname, data_bytes) in enumerate(thumbs):
+            with cols[idx % 3]:
+                st.image(data_bytes, caption=fname, use_container_width=True)
+                st.download_button(
+                    "Download",
+                    data=data_bytes,
+                    file_name=fname,
+                    mime="image/webp",
+                    key=f"dl_{idx}"  # unique key ensures all buttons render
+                )
