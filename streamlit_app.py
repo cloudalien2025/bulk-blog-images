@@ -6,8 +6,8 @@ import streamlit as st
 
 st.set_page_config(page_title="Bulk Blog Image Generator", layout="wide")
 
-# Optional simple team password gate. Leave "" to disable.
-APP_PASSWORD = st.secrets.get("APP_PASSWORD", "")  # or set a hardcoded string here
+# Optional simple team password gate. Leave "" to disable or set via Secrets.
+APP_PASSWORD = st.secrets.get("APP_PASSWORD", "")
 
 SITE_PROFILES = {
     "vailvacay.com":  "Photorealistic alpine resort & village scenes in the Colorado Rockies; ski terrain; evergreen forests; cozy lodges; no text.",
@@ -17,7 +17,7 @@ SITE_PROFILES = {
     "1-800deals.com":  "Photorealistic retail/ecommerce visuals; shopping scenes, parcels, generic products; clean backgrounds; no brands; no text.",
 }
 DEFAULT_SITE = "vailvacay.com"
-API_IMAGE_SIZE = "1536x1024"      # DALL·E supported: 1024x1024, 1024x1536, 1536x1024, or "auto"
+API_IMAGE_SIZE = "1536x1024"      # Supported: 1024x1024, 1024x1536, 1536x1024, or "auto"
 OUTPUT_W, OUTPUT_H = 1200, 675    # final blog size
 DEFAULT_QUALITY = 82              # WebP quality (70–82 is good)
 
@@ -73,25 +73,29 @@ def build_prompt(site: str, keyword: str) -> str:
             f"Create an image for the topic: '{keyword}'. Landscape orientation. No words or typography anywhere. "
             f"Scene intent: {style}.")
 
-def dalle_generate_image_b64(prompt: str, size: str, api_key: str) -> bytes:
-    """Return raw PNG bytes via base64 (more reliable than downloading from URL)."""
+def dalle_generate_image_bytes(prompt: str, size: str, api_key: str) -> bytes:
+    """
+    Call Images API. Prefer base64 if returned; otherwise fall back to URL download.
+    Returns raw PNG bytes.
+    """
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    payload = {
-        "model": "gpt-image-1",
-        "prompt": prompt,
-        "size": size,
-        "response_format": "b64_json"
-    }
+    payload = {"model": "gpt-image-1", "prompt": prompt, "size": size}
     r = requests.post("https://api.openai.com/v1/images/generations",
-                      headers=headers, json=payload, timeout=120)
+                      headers=headers, json=payload, timeout=180)
     if r.status_code != 200:
         raise RuntimeError(f"OpenAI error {r.status_code}: {r.text}")
-    b64 = r.json()["data"][0]["b64_json"]
-    return base64.b64decode(b64)  # PNG bytes
+    data0 = r.json()["data"][0]
+    if "b64_json" in data0:
+        return base64.b64decode(data0["b64_json"])
+    if "url" in data0:
+        resp = requests.get(data0["url"], timeout=180)
+        resp.raise_for_status()
+        return resp.content
+    raise RuntimeError("Images API returned neither b64_json nor url")
 
 # ---------- UI ----------
 st.title("Bulk Blog Image Generator (1200×675 WebP)")
-st.caption("Paste keywords (one per line). Generates DALL·E images, crops to 1200×675, then lets you download a ZIP.")
+st.caption("Paste keywords (one per line). Generates DALL·E images, crops to 1200×675, then bundles a ZIP.")
 
 # Optional password gate
 if APP_PASSWORD:
@@ -133,35 +137,38 @@ if run_btn:
     zip_buf = io.BytesIO()
     zipf = zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED)
     thumbs = []
+    successes = 0
 
     for i, kw in enumerate(keywords, start=1):
         try:
             slug = slugify(kw)
             status.text(f"Generating {i}/{len(keywords)}: {kw}")
 
-            # Generate via base64 → no external URL fetching
-            png_bytes = dalle_generate_image_b64(build_prompt(site, kw), size, user_api_key)
+            # Generate → bytes (PNG), then convert to 1200×675 WebP
+            png_bytes = dalle_generate_image_bytes(build_prompt(site, kw), size, user_api_key)
             img = Image.open(io.BytesIO(png_bytes))
-
-            # Convert to 1200×675 WebP and add to ZIP
             webp_bytes = save_webp_bytes(img, OUTPUT_W, OUTPUT_H, quality)
+
             zipf.writestr(f"{slug}.webp", webp_bytes)
             thumbs.append((f"{slug}.webp", webp_bytes))
+            successes += 1
         except Exception as e:
             st.error(f"{kw}: {e}")
-
         progress.progress(i / len(keywords))
 
     zipf.close()
     zip_buf.seek(0)
 
-    st.success("Done! Download your images below.")
-    st.download_button("⬇️ Download ZIP", data=zip_buf,
-                       file_name=f"{slugify(site)}_images.zip", mime="application/zip")
+    if successes == 0:
+        st.error("No images were generated. Check your API key or try a single keyword.")
+    else:
+        st.success("Done! Download your images below.")
+        st.download_button("⬇️ Download ZIP", data=zip_buf,
+                           file_name=f"{slugify(site)}_images.zip", mime="application/zip")
 
-    st.markdown("### Preview & individual downloads")
-    cols = st.columns(3)
-    for idx, (fname, data_bytes) in enumerate(thumbs):
-        with cols[idx % 3]:
-            st.image(data_bytes, caption=fname, use_container_width=True)
-            st.download_button("Download", data=data_bytes, file_name=fname, mime="image/webp")
+        st.markdown("### Preview & individual downloads")
+        cols = st.columns(3)
+        for idx, (fname, data_bytes) in enumerate(thumbs):
+            with cols[idx % 3]:
+                st.image(data_bytes, caption=fname, use_container_width=True)
+                st.download_button("Download", data=data_bytes, file_name=fname, mime="image/webp")
