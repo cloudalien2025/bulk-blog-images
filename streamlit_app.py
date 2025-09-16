@@ -1,16 +1,19 @@
-# ImageForge Autopilot v2.1.0 — Planner + Critic
-# Rule-light bulk image generation for blogs.
-# AI plans & self-refines prompts; generates 1200×675 WebP images.
-# Per-image downloads + ZIP export.
+# ImageForge Autopilot v2.4.0 — Simple
+# Rule-light bulk image generation for blogs (1200×675 WebP).
+# - AI Planner + Critic craft concise, brand-safe prompts
+# - Optional SerpAPI: reference cues (from image titles only) for ALL keywords,
+#   and price facts hint for pricing queries (never rendered as text)
+# - Per-image downloads + ZIP export
 #
 # Requirements: streamlit, requests, pillow
+# Optional Secrets: OPENAI_API_KEY, SERPAPI_API_KEY, APP_PASSWORD
 
 import io
 import re
 import json
 import base64
 import zipfile
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 import requests
 from PIL import Image
@@ -20,11 +23,11 @@ import streamlit as st
 # App identity & config
 # =========================
 APP_NAME = "ImageForge Autopilot"
-APP_VERSION = "v2.1.0"
+APP_VERSION = "v2.4.0 — Simple"
 
 st.set_page_config(page_title=f"{APP_NAME} — {APP_VERSION}", layout="wide")
 
-# Optional: password gate & default site (can be set in Secrets)
+# Optional: password gate & default site
 APP_PASSWORD = st.secrets.get("APP_PASSWORD", "")
 DEFAULT_SITE = "vailvacay.com"
 
@@ -37,7 +40,7 @@ SITE_PRESETS = {
     "1-800deals.com":  "Retail/e-commerce; parcels, unboxing, generic products; clean backgrounds.",
 }
 
-API_IMAGE_SIZE = "1536x1024"   # Supported: 1024x1024, 1024x1536, 1536x1024, or "auto"
+API_IMAGE_SIZE_OPTIONS = ["1536x1024", "1024x1024", "1024x1536"]  # supported by gpt-image-1
 OUT_W, OUT_H = 1200, 675       # Blog target
 DEFAULT_QUALITY = 82
 
@@ -72,7 +75,7 @@ def to_webp_bytes(img: Image.Image, w: int, h: int, quality: int) -> bytes:
     return buf.getvalue()
 
 def extract_json(txt: str):
-    """Parse JSON that might be wrapped in code fences."""
+    """Parse JSON possibly wrapped in code fences."""
     m = re.search(r"\{.*\}", txt, re.DOTALL)
     if not m:
         return None
@@ -114,10 +117,105 @@ def generate_image_bytes(api_key: str, prompt: str, size: str) -> bytes:
     raise RuntimeError("No image data returned")
 
 # =========================
+# (Optional) SerpAPI helpers
+# =========================
+SERPAPI_DEFAULT = st.secrets.get("SERPAPI_API_KEY", "")
+
+PRICE_TERMS = [
+    "price", "prices", "cost", "how much", "ticket", "tickets", "lift ticket",
+    "gondola ticket", "fee", "fees", "discount", "coupon"
+]
+
+def keyword_is_pricey(k: str) -> bool:
+    kk = k.lower()
+    return any(term in kk for term in PRICE_TERMS)
+
+def serpapi_price_hint(api_key: str, query: str) -> Optional[str]:
+    """Quick search hint for pricing-ish queries. Returns a short text or None."""
+    try:
+        url = "https://serpapi.com/search.json"
+        params = {"engine": "google", "q": query, "num": 5, "api_key": api_key}
+        r = requests.get(url, params=params, timeout=20)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+
+        texts = []
+        ab = data.get("answer_box") or {}
+        for k in ("snippet", "title", "answer"):
+            v = ab.get(k)
+            if isinstance(v, str):
+                texts.append(v)
+        for res in data.get("organic_results", [])[:5]:
+            for k in ("snippet", "title"):
+                v = res.get(k)
+                if isinstance(v, str):
+                    texts.append(v)
+
+        blob = " ".join(texts)[:1000]
+        m = re.findall(r"\$\s*\d{2,4}", blob)
+        if m:
+            uniq = sorted(set(s.replace(" ", "") for s in m))
+            joined = ", ".join(uniq[:4])
+            return f"Public search hints show figures like: {joined}. Treat as reference only; do not render text or numbers."
+        if blob:
+            return "Public search hints retrieved. Treat as reference only; do not render text or numbers."
+        return None
+    except Exception:
+        return None
+
+def serpapi_image_titles(api_key: str, query: str, cc_only: bool = True, max_items: int = 6) -> List[str]:
+    """Return a list of image titles from Google Images results via SerpAPI (no downloading)."""
+    try:
+        url = "https://serpapi.com/search.json"
+        params = {
+            "engine": "google",
+            "q": query,
+            "tbm": "isch",   # image search
+            "ijn": "0",
+            "api_key": api_key
+        }
+        if cc_only:
+            params["tbs"] = "sur:fc"  # Creative Commons filter
+        r = requests.get(url, params=params, timeout=20)
+        if r.status_code != 200:
+            return []
+        data = r.json()
+        results = data.get("images_results", [])[:max_items]
+        titles = []
+        for it in results:
+            t = it.get("title")
+            if isinstance(t, str) and t.strip():
+                titles.append(t.strip())
+        return titles
+    except Exception:
+        return []
+
+def summarize_titles_to_cues(openai_key: str, keyword: str, titles: List[str]) -> List[str]:
+    """Use GPT to convert raw image titles into neutral visual cues (no brands/text)."""
+    if not titles:
+        return []
+    sys = (
+        "You are a visual summarizer. Given a keyword and a set of image titles from a public image search, "
+        "extract 3–6 neutral visual cues that would help illustrate the topic without copying or rendering text. "
+        "Avoid brands, readable signage, and explicit content. "
+        "Return JSON ONLY: {\"cues\": [\"cue1\", \"cue2\", ...]}"
+    )
+    user = f"Keyword: {keyword}\nTitles:\n- " + "\n- ".join(titles)
+    content = chat_completion(openai_key, [
+        {"role": "system", "content": sys},
+        {"role": "user", "content": user}
+    ], temperature=0.2)
+    data = extract_json(content)
+    if not data or "cues" not in data or not isinstance(data["cues"], list):
+        return []
+    cues = [str(c)[:100] for c in data["cues"] if isinstance(c, str)]
+    return cues[:6]
+
+# =========================
 # Planner + Critic
 # =========================
 
-# Base planner instructions (site-agnostic + pattern nudges)
 PLANNER_BASE = """
 You are a senior creative director writing photorealistic image briefs
 for a travel/consumer blog. Given a keyword and a site vibe, craft ONE concise prompt
@@ -133,12 +231,16 @@ Pattern nudges for question-style keywords (examples, not outputs):
 - "what river runs through …": make the river the hero (close/mid view of the water through town), with the place context secondary.
 - "what mountain range is … in": emphasize defining ridgelines/peaks; town minimal.
 - "how far is … from …": travel-planning vibe (map with two pinned points or dashboard/GPS scene); avoid readable text.
+
+Price/cost/ticket keywords:
+- Depict a conceptual price-checking or planning scene (ticket window with blurred board, phone with out-of-focus checkout page, pass + gloves on a counter).
+- Absolutely do not render readable numbers, prices, or legible signage. Blur or angle any displays so details are unreadable.
 """
 
-# Tiny, optional site-specific nudges
 SITE_NUDGES = {
     "vailvacay.com": [
         "Snow topics: if ski/back bowls/lift tickets appear, winter conditions are natural; think snowy slopes and lift infrastructure.",
+        "For lift-ticket/gondola price topics: show conceptual scene only (blurred board or phone screen); never readable numbers."
     ],
     "bostonvacay.com": [
         "Ferry/Bar Harbor trips: boarding ramp or terminal scene with vessel in frame; signage generic/debranded.",
@@ -159,14 +261,18 @@ SITE_NUDGES = {
     ],
 }
 
-def build_planner_system(site_key: str) -> str:
+def build_planner_system(site_key: str, facts_hint: Optional[str], ref_cues: List[str]) -> str:
     nudges = SITE_NUDGES.get(site_key, [])
-    site_block = ""
-    if nudges:
-        site_block = "\nSite-specific nudges:\n- " + "\n- ".join(nudges) + "\n"
+    site_block = "\nSite-specific nudges:\n- " + "\n- ".join(nudges) + "\n" if nudges else ""
+    facts_block = f"\nContext (for concept only; do NOT render text or numbers):\n- {facts_hint}\n" if facts_hint else ""
+    cues_block = ""
+    if ref_cues:
+        cues_block = "\nReference cues (from public image titles; inspiration only, do not copy layouts; no text/logos):\n- " + "\n- ".join(ref_cues[:6]) + "\n"
     return (
         PLANNER_BASE
         + site_block
+        + facts_block
+        + cues_block
         + '\nOutput JSON ONLY:\n{"prompt": "<final one- or two-sentence prompt>"}'
     )
 
@@ -174,18 +280,20 @@ CRITIC_SYSTEM = """
 You are a prompt critic. Given a keyword and a proposed image prompt,
 decide if the prompt obviously covers the keyword. If missing, revise succinctly.
 Keep style constraints intact (no text/logos, non-explicit; balanced composition; landscape).
+For price/cost/ticket topics, ensure it forbids readable numbers/prices/signage and uses a conceptual scene.
+Use provided reference cues only as inspiration; do not copy layouts or text.
 Output JSON ONLY:
 - If OK: {"action":"ok"}
 - If needs fix: {"action":"refine","prompt":"<better prompt>"}
 """
 
-def plan_prompt(api_key: str, site_vibe: str, keyword: str, global_vibe: str, site_key: str) -> str:
-    planner_system = build_planner_system(site_key)
+def plan_prompt(api_key: str, site_vibe: str, keyword: str, site_key: str,
+                facts_hint: Optional[str], ref_cues: List[str]) -> str:
+    planner_system = build_planner_system(site_key, facts_hint, ref_cues)
     user = f"""Site vibe: {site_vibe}
 Keyword: {keyword}
-Global vibe tag (optional): {global_vibe}
 
-Write a single, photorealistic travel-blog prompt that:
+Write one photorealistic travel-blog prompt that:
 - Clearly signals the topic with obvious visual cues
 - Chooses indoor vs outdoor and season naturally from the keyword
 - Stays safe and brand-neutral
@@ -196,7 +304,6 @@ Write a single, photorealistic travel-blog prompt that:
     ])
     data = extract_json(content)
     if not data or "prompt" not in data:
-        # Fall back to raw text if JSON parse fails
         return content
     return data["prompt"]
 
@@ -217,37 +324,34 @@ def critique_and_refine(api_key: str, keyword: str, prompt: str) -> str:
 # UI
 # =========================
 st.title(f"{APP_NAME} — {APP_VERSION}")
-st.caption("Paste keywords (one per line). The AI plans and self-refines prompts, then generates 1200×675 WebP images. Rule-light, brand-safe visuals.")
+st.caption("Paste keywords (one per line). Planner + Critic craft brand-safe prompts. "
+           "If you add a SerpAPI key, we use reference cues for all keywords and a price facts hint for price queries (never rendered as text). "
+           "Output: 1200×675 WebP, ZIP + per-image downloads.")
 
 if APP_PASSWORD:
-    pw = st.text_input("Team password", type="password")
-    if pw != APP_PASSWORD:
+    gate = st.text_input("Team password", type="password")
+    if gate != APP_PASSWORD:
         st.stop()
 
 with st.sidebar:
     site = st.selectbox("Site", list(SITE_PRESETS.keys()),
                         index=list(SITE_PRESETS.keys()).index(DEFAULT_SITE))
     quality = st.slider("WebP quality", 60, 95, DEFAULT_QUALITY)
-    size = st.selectbox("Render size", ["1536x1024", "1024x1024", "1024x1536"], index=0)
-    with st.expander("Advanced (optional)"):
-        global_vibe = st.selectbox(
-            "Global vibe tag (optional)",
-            ["", "golden hour", "bluebird sky", "light snow", "after-rain glow",
-             "human-forward framing", "wider vista", "cozy indoor"],
-            index=0
-        )
+    render_size = st.selectbox("Render size", API_IMAGE_SIZE_OPTIONS, index=0)
+    serpapi_key = st.text_input("SERPAPI_API_KEY (optional)", type="password",
+                                value=SERPAPI_DEFAULT, help="If provided, we add reference cues for all keywords and price hints for price queries.")
 
 openai_key = st.text_input(
     "OpenAI API key",
     type="password",
     value=st.secrets.get("OPENAI_API_KEY", ""),
-    help="Or set OPENAI_API_KEY in Streamlit Secrets."
+    help="You can also set OPENAI_API_KEY in Streamlit Secrets."
 )
 
 keywords_text = st.text_area(
     "Keywords (one per line)",
     height=280,
-    placeholder="Things to Do in Vail with a Baby\nIndoor activities Vail\nBoston to Bar Harbor ferry\nBTS to Chinatown Bangkok\nWhat county is Vail",
+    placeholder="best seafood restaurant in Boston\nwhat county is Vail\nhow much are lift tickets at Vail\nBTS to Chinatown Bangkok\ndog friendly hotel in Vail",
 )
 
 c1, c2 = st.columns(2)
@@ -259,11 +363,29 @@ if c2.button("Clear"):
 # =========================
 # Run
 # =========================
-def do_one(api_key: str, keyword: str, site_key: str, global_vibe: str, render_size: str, quality: int) -> Tuple[str, bytes]:
+def do_one(api_key: str, keyword: str, site_key: str, render_size: str, quality: int,
+           serpapi_key: str) -> Tuple[str, bytes, Optional[str], List[str], List[str]]:
+    """
+    Returns: (final_prompt, webp_bytes, facts_hint, ref_titles, ref_cues)
+    """
     site_vibe = SITE_PRESETS.get(site_key, SITE_PRESETS[DEFAULT_SITE])
 
+    # (Optional) SerpAPI: price facts hint for price-y queries
+    facts_hint = None
+    if serpapi_key and keyword_is_pricey(keyword):
+        q = f"{keyword} {site_key.split('.')[0]}"
+        facts_hint = serpapi_price_hint(serpapi_key, q)
+
+    # (Optional) SerpAPI: reference cues via image titles (always try if key provided)
+    ref_titles: List[str] = []
+    ref_cues: List[str] = []
+    if serpapi_key:
+        q = f"{keyword} {site_key.split('.')[0]}"
+        ref_titles = serpapi_image_titles(serpapi_key, q, cc_only=True, max_items=5)
+        ref_cues = summarize_titles_to_cues(api_key, keyword, ref_titles) if ref_titles else []
+
     # 1) Planner
-    base_prompt = plan_prompt(api_key, site_vibe, keyword, global_vibe or "auto", site_key=site_key)
+    base_prompt = plan_prompt(api_key, site_vibe, keyword, site_key, facts_hint, ref_cues)
 
     # 2) Critic (single-pass refine if needed)
     final_prompt = critique_and_refine(api_key, keyword, base_prompt)
@@ -271,7 +393,7 @@ def do_one(api_key: str, keyword: str, site_key: str, global_vibe: str, render_s
     # 3) Image
     png = generate_image_bytes(api_key, final_prompt, render_size)
     img = Image.open(io.BytesIO(png))
-    return final_prompt, to_webp_bytes(img, OUT_W, OUT_H, quality)
+    return final_prompt, to_webp_bytes(img, OUT_W, OUT_H, quality), facts_hint, ref_titles, ref_cues
 
 if run:
     if not openai_key:
@@ -286,7 +408,10 @@ if run:
     prog = st.progress(0)
     status = st.empty()
     thumbs: List[Tuple[str, bytes]] = []
-    prompts_used: List[Tuple[str, str]] = []  # (fname, prompt)
+    prompts_used: List[Tuple[str, str]] = []     # (fname, prompt)
+    facts_notes: List[Tuple[str, str]] = []      # (fname, facts_hint)
+    ref_notes: List[Tuple[str, List[str], List[str]]] = []  # (fname, titles, cues)
+
     zip_buf = io.BytesIO()
     zipf = zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED)
 
@@ -294,10 +419,16 @@ if run:
         fname = f"{slugify(kw)}.webp"
         try:
             status.text(f"Generating {i}/{len(kws)}: {kw}")
-            prompt_used, webp = do_one(openai_key, kw, site, global_vibe, size, quality)
+            prompt_used, webp, facts_hint, ref_titles, ref_cues = do_one(
+                openai_key, kw, site, render_size, quality, serpapi_key
+            )
             zipf.writestr(fname, webp)
             thumbs.append((fname, webp))
             prompts_used.append((fname, prompt_used))
+            if facts_hint:
+                facts_notes.append((fname, facts_hint))
+            if ref_titles or ref_cues:
+                ref_notes.append((fname, ref_titles, ref_cues))
         except Exception as e:
             st.error(f"{kw}: {e}")
         prog.progress(i/len(kws))
@@ -325,3 +456,21 @@ if run:
             for fname, p in prompts_used:
                 st.markdown(f"**{fname}**")
                 st.code(p, language="text")
+
+        if facts_notes:
+            with st.expander("Price facts assist (reference only)"):
+                for fname, note in facts_notes:
+                    st.markdown(f"**{fname}**")
+                    st.write(note)
+
+        if ref_notes:
+            with st.expander("Reference cues (from public image titles)"):
+                st.write("Used as inspiration only; no external images were downloaded.")
+                for fname, titles, cues in ref_notes:
+                    st.markdown(f"**{fname}**")
+                    if titles:
+                        st.markdown("- Raw titles:")
+                        st.write("; ".join(titles))
+                    if cues:
+                        st.markdown("- Summarized cues used:")
+                        st.write(", ".join(cues))
