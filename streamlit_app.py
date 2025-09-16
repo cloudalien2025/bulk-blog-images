@@ -1,3 +1,4 @@
+import base64
 import os, io, re, time, zipfile, requests
 from typing import List
 from PIL import Image
@@ -70,12 +71,20 @@ def build_prompt(site: str, keyword: str) -> str:
             f"Create an image for the topic: '{keyword}'. Landscape orientation. No words or typography anywhere. "
             f"Scene intent: {style}.")
 
-def dalle_generate_url(prompt: str, size: str, api_key: str) -> str:
+def dalle_generate_image_b64(prompt: str, size: str, api_key: str) -> bytes:
+    """Return raw PNG bytes via base64 (more reliable than downloading from URL)."""
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    payload = {"model": "gpt-image-1", "prompt": prompt, "size": size}
-    r = requests.post("https://api.openai.com/v1/images/generations", headers=headers, json=payload, timeout=90)
-    if r.status_code != 200: raise RuntimeError(f"OpenAI error {r.status_code}: {r.text}")
-    return r.json()["data"][0]["url"]
+    payload = {
+        "model": "gpt-image-1",
+        "prompt": prompt,
+        "size": size,
+        "response_format": "b64_json"   # <- key change
+    }
+    r = requests.post("https://api.openai.com/v1/images/generations", headers=headers, json=payload, timeout=120)
+    if r.status_code != 200:
+        raise RuntimeError(f"OpenAI error {r.status_code}: {r.text}")
+    b64 = r.json()["data"][0]["b64_json"]
+    return base64.b64decode(b64)  # PNG bytes
 
 st.title("Bulk Blog Image Generator (1200×675 WebP)")
 st.caption("Paste keywords (one per line). Generates DALL·E images, crops to 1200×675, then lets you download a ZIP.")
