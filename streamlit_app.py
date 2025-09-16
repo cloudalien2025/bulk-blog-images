@@ -1,5 +1,6 @@
-# VacayForge Autopilot v1.0.0
+# ImageForge Autopilot v1.0.1
 # Bulk, plug-and-play blog images with per-image downloads + ZIP export.
+# Now with indoor/outdoor intent steering & strong negatives.
 # Requirements: streamlit, requests, pillow
 
 import base64
@@ -13,11 +14,8 @@ import requests
 from PIL import Image
 import streamlit as st
 
-# ==============================
-# App identity & config
-# ==============================
-APP_NAME = "VacayForge Autopilot"
-APP_VERSION = "v1.0.0"
+APP_NAME = "ImageForge Autopilot"
+APP_VERSION = "v1.0.1"
 
 st.set_page_config(page_title=f"{APP_NAME} — {APP_VERSION}", layout="wide")
 
@@ -26,7 +24,7 @@ APP_PASSWORD = st.secrets.get("APP_PASSWORD", "")
 DEFAULT_SITE = "vailvacay.com"
 
 SITE_PRESETS = {
-    "vailvacay.com":  "Colorado alpine resort & village; riverside paths, gondola stations, evergreen forests, cozy lodges; photorealistic; no text.",
+    "vailvacay.com":  "Colorado alpine resort & village; paths, rivers, gondola stations, cozy lodges; photorealistic; no text.",
     "bostonvacay.com": "New England city; Beacon Hill brownstones, harborwalk, Charles River, stations; photorealistic; no text.",
     "bangkokvacay.com":"Southeast Asian metropolis; temples, canals, night markets, BTS/MRT; photorealistic; no text.",
     "ipetzo.com":      "Pet lifestyle; dogs/cats with owners in parks or cozy homes; neutral interiors; photorealistic; no brands; no text.",
@@ -37,9 +35,7 @@ API_IMAGE_SIZE = "1536x1024"     # Supported: 1024x1024, 1024x1536, 1536x1024
 OUTPUT_W, OUTPUT_H = 1200, 675   # Blog target
 DEFAULT_QUALITY = 82
 
-# ==============================
-# Utils
-# ==============================
+# ---------------- Utils ----------------
 def slugify(text: str) -> str:
     t = text.lower().strip()
     t = re.sub(r"[’'`]", "", t)
@@ -65,11 +61,9 @@ def to_webp_bytes(img: Image.Image, w: int, h: int, quality: int) -> bytes:
     img.save(buf, "WEBP", quality=quality, method=6)
     return buf.getvalue()
 
-# ==============================
-# Prompt planner — Autopilot
-# ==============================
+# ------------- Prompt planner -------------
 def site_negatives(site: str) -> str:
-    common = "No text or typography overlay; avoid readable signs/logos; privacy-respecting; non-explicit."
+    common = "No text/typography; avoid readable signs/logos; privacy-respecting; non-explicit."
     if site == "1-800deals.com":
         return common + " Packaging must be generic with blank labels; avoid trademarks/SKUs/barcodes."
     if site == "ipetzo.com":
@@ -81,6 +75,14 @@ def site_negatives(site: str) -> str:
     if site == "bangkokvacay.com":
         return common + " Nightlife scenes: exterior/cabaret entrance only; no lewd or explicit content."
     return common
+
+def env_from_keyword(keyword: str) -> str:
+    k = keyword.lower()
+    if any(w in k for w in ["indoor", "inside", "rainy day", "rainy-day", "bad weather", "winter activities indoors"]):
+        return "indoor"
+    if any(w in k for w in ["outdoor", "outside", "hike", "trail", "scenic", "vista"]):
+        return "outdoor"
+    return "auto"
 
 def season_hint(keyword: str) -> str:
     k = keyword.lower()
@@ -94,18 +96,27 @@ def season_hint(keyword: str) -> str:
         return "summer warmth if relevant"
     return "seasonally appropriate light"
 
-def subject_cues(keyword: str) -> Tuple[List[str], List[str]]:
-    """
-    Returns (soft_cues, strong_refine_cues).
-    Minimal universal cues so results scream the topic.
-    """
+def subject_cues(keyword: str, env: str) -> Tuple[List[str], List[str]]:
+    """Returns (soft_cues, strong_refine_cues)."""
     k = keyword.lower()
     cues, strong = [], []
 
+    # Indoor / Outdoor steering (first so it dominates)
+    if env == "indoor":
+        cues.append("indoor setting with visible ceiling and walls, ambient lighting, windows optional")
+        strong.append("clear interior architecture (ceiling + walls) and activity context; exclude outdoor vistas")
+    elif env == "outdoor":
+        cues.append("outdoor setting with natural light and terrain features")
+
+    # Family / baby
     if any(w in k for w in ["baby", "infant", "kid", "family", "with kids"]):
-        cues.append("parent with stroller or front baby carrier on a safe path or play area")
+        if env == "indoor":
+            cues.append("family-friendly indoor activity such as play corner, climbing wall, skating, or rec room")
+        else:
+            cues.append("parent with stroller or front baby carrier on a safe path or play area")
         strong.append("parent clearly pushing a stroller or wearing a front baby carrier in the foreground")
 
+    # Transport / venues / categories
     if any(w in k for w in ["gondola", "ski lift", "lift tickets"]):
         cues.append("gondola cabin or station visibly in frame")
         strong.append("a gondola cabin prominently in the scene near the subject")
@@ -143,7 +154,15 @@ def subject_cues(keyword: str) -> Tuple[List[str], List[str]]:
 def build_prompt(site: str, keyword: str, variation: str = "") -> Tuple[str, List[str]]:
     base = SITE_PRESETS.get(site, SITE_PRESETS[DEFAULT_SITE])
     negs = site_negatives(site)
-    cues, strong = subject_cues(keyword)
+    env = env_from_keyword(keyword)
+    cues, strong = subject_cues(keyword, env)
+
+    # Environment-specific negatives to prevent model drift
+    env_negs = ""
+    if env == "indoor":
+        env_negs = " Exclude rivers, gondolas, ski slopes, and wide outdoor landscape vistas."
+    elif env == "outdoor":
+        env_negs = " Avoid obvious indoor scenes unless essential."
 
     composition = (
         "balanced composition, natural light, editorial stock-photo feel; "
@@ -151,12 +170,18 @@ def build_prompt(site: str, keyword: str, variation: str = "") -> Tuple[str, Lis
     )
     season = season_hint(keyword)
 
-    chips = [composition, season, negs]
+    chips = [composition, season, negs + env_negs]
     if variation:
         chips.append(variation)
 
-    # Primary brief (one crisp sentence + chips + soft cues)
-    core = f"Create a photorealistic travel blog image for: '{keyword}'. Site vibe: {base} "
+    # Primary brief (short, decisive)
+    core = f"Create a photorealistic travel blog image for: '{keyword}'. "
+    if env == "indoor":
+        core += "Use an indoor activity scene only. "
+    elif env == "outdoor":
+        core += "Use an outdoor scene. "
+    core += f"Site vibe: {base} "
+
     if cues:
         core += "Include clear visual cues: " + "; ".join(cues) + ". "
 
@@ -169,12 +194,8 @@ def refine_prompt(original_prompt: str, strong_cues: List[str]) -> str:
     return original_prompt + " Make the subject unmistakable in frame. Emphasize: " + "; ".join(strong_cues) + "."
 
 def dalle_image_bytes(prompt: str, size: str, api_key: str) -> bytes:
-    """
-    Call OpenAI Images API (gpt-image-1). Decode base64 if present, else fetch URL.
-    """
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     payload = {"model": "gpt-image-1", "prompt": prompt, "size": size}
-
     r = requests.post("https://api.openai.com/v1/images/generations",
                       headers=headers, json=payload, timeout=180)
     if r.status_code != 200:
@@ -188,12 +209,10 @@ def dalle_image_bytes(prompt: str, size: str, api_key: str) -> bytes:
         return resp.content
     raise RuntimeError("Images API returned neither b64_json nor url")
 
-# ==============================
-# UI — minimal Autopilot
-# ==============================
+# ------------- UI -------------
 st.title(f"{APP_NAME} — {APP_VERSION}")
 st.caption("Paste keywords (one per line), choose a site, click Generate. The app plans a brief per keyword, "
-           "adds subject cues, and outputs 1200×675 WebP images with per-image downloads + a ZIP file.")
+           "adds subject cues, forces indoor/outdoor when requested, and outputs 1200×675 WebP images with per-image downloads + ZIP.")
 
 if APP_PASSWORD:
     gate = st.text_input("Team password", type="password")
@@ -229,7 +248,7 @@ keywords_text = st.text_area(
     "Keywords (one per line)",
     height=260,
     placeholder=(
-        "Things to Do in Vail with a Baby\n"
+        "Indoor activities Vail\n"
         "BTS to Chinatown Bangkok\n"
         "Boston to Bar Harbor ferry\n"
         "Best restaurants in Vail"
@@ -242,9 +261,7 @@ if col2.button("Clear"):
     st.session_state.clear()
     st.experimental_rerun()
 
-# ==============================
-# Run — batch (1 image per keyword), auto-refine once if cues exist
-# ==============================
+# ------------- Run -------------
 if run:
     if not openai_key:
         st.warning("Please enter your OpenAI API key.")
@@ -267,19 +284,18 @@ if run:
         try:
             status.text(f"Generating {i}/{len(keywords)}: {kw}")
 
-            # First pass
             prompt, strong_cues = build_prompt(site, kw, variation_choice)
             png_bytes = dalle_image_bytes(prompt, size, openai_key)
             img = Image.open(io.BytesIO(png_bytes))
 
-            # Auto-refine once if there are strong cues
+            # Auto-refine once if there are strong cues (helps enforce indoor/outdoor + subject)
             if strong_cues:
                 try:
                     refined = refine_prompt(prompt, strong_cues)
                     png_bytes2 = dalle_image_bytes(refined, size, openai_key)
                     img = Image.open(io.BytesIO(png_bytes2))
                 except Exception:
-                    pass  # keep first image if refine fails
+                    pass
 
             webp = to_webp_bytes(img, OUTPUT_W, OUTPUT_H, quality)
             zipf.writestr(f"{slug}.webp", webp)
@@ -316,5 +332,5 @@ if run:
                     data=data_bytes,
                     file_name=fname,
                     mime="image/webp",
-                    key=f"dl_{idx}"  # unique key ensures all buttons render
+                    key=f"dl_{idx}"
                 )
