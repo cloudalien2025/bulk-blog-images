@@ -1,11 +1,11 @@
-# ImageForge Autopilot v1.0.1
+# ImageForge Autopilot v1.2.0
 # Bulk, plug-and-play blog images with per-image downloads + ZIP export.
-# Now with indoor/outdoor intent steering & strong negatives.
+# Season-aware (forces winter when ski/snow terms appear), indoor/outdoor steering,
+# subject cues, brand-safety negatives.
 # Requirements: streamlit, requests, pillow
 
 import base64
 import io
-import random
 import re
 import zipfile
 from typing import List, Tuple
@@ -15,7 +15,7 @@ from PIL import Image
 import streamlit as st
 
 APP_NAME = "ImageForge Autopilot"
-APP_VERSION = "v1.0.1"
+APP_VERSION = "v1.2.0"
 
 st.set_page_config(page_title=f"{APP_NAME} — {APP_VERSION}", layout="wide")
 
@@ -24,7 +24,7 @@ APP_PASSWORD = st.secrets.get("APP_PASSWORD", "")
 DEFAULT_SITE = "vailvacay.com"
 
 SITE_PRESETS = {
-    "vailvacay.com":  "Colorado alpine resort & village; paths, rivers, gondola stations, cozy lodges; photorealistic; no text.",
+    "vailvacay.com":  "Colorado alpine resort & village; gondola/base areas, evergreen forests, cozy lodges; photorealistic; no text.",
     "bostonvacay.com": "New England city; Beacon Hill brownstones, harborwalk, Charles River, stations; photorealistic; no text.",
     "bangkokvacay.com":"Southeast Asian metropolis; temples, canals, night markets, BTS/MRT; photorealistic; no text.",
     "ipetzo.com":      "Pet lifestyle; dogs/cats with owners in parks or cozy homes; neutral interiors; photorealistic; no brands; no text.",
@@ -62,6 +62,20 @@ def to_webp_bytes(img: Image.Image, w: int, h: int, quality: int) -> bytes:
     return buf.getvalue()
 
 # ------------- Prompt planner -------------
+MONTH_WORDS = {
+    "jan":"winter", "january":"winter",
+    "feb":"winter", "february":"winter",
+    "mar":"spring", "march":"spring",
+    "apr":"spring", "april":"spring",
+    "may":"spring", "jun":"summer", "june":"summer",
+    "jul":"summer", "july":"summer",
+    "aug":"summer", "august":"summer",
+    "sep":"fall", "sept":"fall", "september":"fall",
+    "oct":"fall", "october":"fall",
+    "nov":"fall", "november":"fall",
+    "dec":"winter", "december":"winter",
+}
+
 def site_negatives(site: str) -> str:
     common = "No text/typography; avoid readable signs/logos; privacy-respecting; non-explicit."
     if site == "1-800deals.com":
@@ -78,30 +92,61 @@ def site_negatives(site: str) -> str:
 
 def env_from_keyword(keyword: str) -> str:
     k = keyword.lower()
-    if any(w in k for w in ["indoor", "inside", "rainy day", "rainy-day", "bad weather", "winter activities indoors"]):
+    if any(w in k for w in ["indoor", "inside", "rainy day", "rainy-day", "bad weather", "indoors"]):
         return "indoor"
     if any(w in k for w in ["outdoor", "outside", "hike", "trail", "scenic", "vista"]):
         return "outdoor"
     return "auto"
 
-def season_hint(keyword: str) -> str:
+def season_enforcement(keyword: str) -> str:
+    """Return 'winter_forced', 'summer_forced', 'fall_forced', 'spring_forced', or 'auto'."""
     k = keyword.lower()
-    if any(w in k for w in ["winter", "snow", "dec", "jan", "feb", "christmas"]):
-        return "winter atmosphere if relevant"
-    if any(w in k for w in ["fall", "autumn", "sept", "oct", "nov", "foliage"]):
-        return "autumn foliage if relevant"
-    if any(w in k for w in ["spring", "apr", "may"]):
-        return "spring greens if relevant"
-    if any(w in k for w in ["summer", "jun", "jul", "aug", "patio"]):
-        return "summer warmth if relevant"
+
+    # Anything explicitly winter/snow/ski forces winter
+    ski_terms = [
+        "ski ", " skier", "skiing", "ski-", "snowboard", "powder", "groomer",
+        "back bowl", "back bowls", "lift ticket", "chairlift", "opening day", "closing day",
+        "snow", "winter", "ski patrol"
+    ]
+    if any(term in k for term in ski_terms):
+        return "winter_forced"
+
+    # Month/season hints
+    for word, season in MONTH_WORDS.items():
+        if word in k:
+            return f"{season}_forced"
+
+    if "memorial day" in k or "labor day" in k:
+        return "summer_forced"
+    if "thanksgiving" in k:
+        return "fall_forced"
+
+    return "auto"
+
+def season_hint_text(mode: str) -> str:
+    if mode == "winter_forced": return "Use winter snow conditions only."
+    if mode == "summer_forced": return "Use summer warmth and greenery."
+    if mode == "fall_forced":   return "Use autumn foliage and crisp light."
+    if mode == "spring_forced": return "Use spring greens and melting snow."
     return "seasonally appropriate light"
 
-def subject_cues(keyword: str, env: str) -> Tuple[List[str], List[str]]:
+def season_negatives(mode: str) -> str:
+    if mode == "winter_forced":
+        return (" Snow-covered slopes and roofs; snow-dusted evergreens; winter clothing; "
+                "breath vapor possible. Exclude green grass, leafy summer foliage, dirt trails, "
+                "and flowing rivers unless iced or snow-edged.")
+    if mode in ("summer_forced", "spring_forced"):
+        return " Exclude snow-covered slopes unless explicitly necessary."
+    if mode == "fall_forced":
+        return " Prefer fall colors; exclude heavy summer greens and mid-winter deep snow."
+    return ""
+
+def subject_cues(keyword: str, env: str, season_mode: str) -> Tuple[List[str], List[str]]:
     """Returns (soft_cues, strong_refine_cues)."""
     k = keyword.lower()
     cues, strong = [], []
 
-    # Indoor / Outdoor steering (first so it dominates)
+    # Environment
     if env == "indoor":
         cues.append("indoor setting with visible ceiling and walls, ambient lighting, windows optional")
         strong.append("clear interior architecture (ceiling + walls) and activity context; exclude outdoor vistas")
@@ -111,15 +156,23 @@ def subject_cues(keyword: str, env: str) -> Tuple[List[str], List[str]]:
     # Family / baby
     if any(w in k for w in ["baby", "infant", "kid", "family", "with kids"]):
         if env == "indoor":
-            cues.append("family-friendly indoor activity such as play corner, climbing wall, skating, or rec room")
+            cues.append("family-friendly indoor activity such as play corner, skating, climbing wall, or rec room")
         else:
             cues.append("parent with stroller or front baby carrier on a safe path or play area")
         strong.append("parent clearly pushing a stroller or wearing a front baby carrier in the foreground")
 
+    # Ski-specific: force winter look + gear realism
+    if "ski patrol" in k or "ski " in k or "skiing" in k or "snowboard" in k or "back bowl" in k:
+        cues.append("alpine ski area context with snowy slopes and lift infrastructure")
+        strong.append("snow-covered slope in view; winter clothing and equipment appropriate to skiing")
+
+        if "ski patrol" in k:
+            cues.append("ski patrol member in red outerwear with generic white cross insignia (no brand), on snow near slope or base area; rescue sled or skis nearby")
+            strong.append("patroller standing on snow with slope and lift in the background; no green lawns")
+
     # Transport / venues / categories
-    if any(w in k for w in ["gondola", "ski lift", "lift tickets"]):
+    if any(w in k for w in ["gondola", "lift ticket", "chairlift"]) and "ski" not in k and season_mode != "winter_forced":
         cues.append("gondola cabin or station visibly in frame")
-        strong.append("a gondola cabin prominently in the scene near the subject")
 
     if any(w in k for w in ["restaurant", "burger", "sushi", "dining", "eat", "cafe", "breakfast", "brunch", "patio"]):
         cues.append("dining context with a plated dish or table setting (no logos, no readable menus)")
@@ -155,22 +208,26 @@ def build_prompt(site: str, keyword: str, variation: str = "") -> Tuple[str, Lis
     base = SITE_PRESETS.get(site, SITE_PRESETS[DEFAULT_SITE])
     negs = site_negatives(site)
     env = env_from_keyword(keyword)
-    cues, strong = subject_cues(keyword, env)
+    season_mode = season_enforcement(keyword)
+    cues, strong = subject_cues(keyword, env, season_mode)
 
-    # Environment-specific negatives to prevent model drift
+    # Environment-specific negatives to prevent drift
     env_negs = ""
     if env == "indoor":
         env_negs = " Exclude rivers, gondolas, ski slopes, and wide outdoor landscape vistas."
     elif env == "outdoor":
         env_negs = " Avoid obvious indoor scenes unless essential."
 
+    # Season steering
+    season_line = season_hint_text(season_mode)
+    season_negs = season_negatives(season_mode)
+
     composition = (
         "balanced composition, natural light, editorial stock-photo feel; "
         "clear foreground subject and layered background; landscape orientation."
     )
-    season = season_hint(keyword)
 
-    chips = [composition, season, negs + env_negs]
+    chips = [composition, season_line, negs + env_negs + season_negs]
     if variation:
         chips.append(variation)
 
@@ -211,8 +268,8 @@ def dalle_image_bytes(prompt: str, size: str, api_key: str) -> bytes:
 
 # ------------- UI -------------
 st.title(f"{APP_NAME} — {APP_VERSION}")
-st.caption("Paste keywords (one per line), choose a site, click Generate. The app plans a brief per keyword, "
-           "adds subject cues, forces indoor/outdoor when requested, and outputs 1200×675 WebP images with per-image downloads + ZIP.")
+st.caption("Paste keywords (one per line) → Generate. The app plans a brief per keyword, adds subject cues, "
+           "forces winter when ski/snow terms appear, honors indoor/outdoor requests, and outputs 1200×675 WebP images.")
 
 if APP_PASSWORD:
     gate = st.text_input("Team password", type="password")
@@ -248,10 +305,11 @@ keywords_text = st.text_area(
     "Keywords (one per line)",
     height=260,
     placeholder=(
+        "Vail ski patrol salary\n"
+        "When do Vail Back Bowls open\n"
         "Indoor activities Vail\n"
         "BTS to Chinatown Bangkok\n"
-        "Boston to Bar Harbor ferry\n"
-        "Best restaurants in Vail"
+        "Boston to Bar Harbor ferry"
     ),
 )
 
@@ -288,7 +346,7 @@ if run:
             png_bytes = dalle_image_bytes(prompt, size, openai_key)
             img = Image.open(io.BytesIO(png_bytes))
 
-            # Auto-refine once if there are strong cues (helps enforce indoor/outdoor + subject)
+            # Auto-refine once if there are strong cues (enforces winter/indoor/subject)
             if strong_cues:
                 try:
                     refined = refine_prompt(prompt, strong_cues)
