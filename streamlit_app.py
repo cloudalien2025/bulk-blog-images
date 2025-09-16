@@ -7,7 +7,7 @@ import streamlit as st
 st.set_page_config(page_title="Bulk Blog Image Generator", layout="wide")
 
 # Optional simple team password gate. Leave "" to disable.
-APP_PASSWORD = ""
+APP_PASSWORD = st.secrets.get("APP_PASSWORD", "")  # or set a hardcoded string here
 
 SITE_PROFILES = {
     "vailvacay.com":  "Photorealistic alpine resort & village scenes in the Colorado Rockies; ski terrain; evergreen forests; cozy lodges; no text.",
@@ -17,10 +17,11 @@ SITE_PROFILES = {
     "1-800deals.com":  "Photorealistic retail/ecommerce visuals; shopping scenes, parcels, generic products; clean backgrounds; no brands; no text.",
 }
 DEFAULT_SITE = "vailvacay.com"
-API_IMAGE_SIZE = "1536x1024"
-OUTPUT_W, OUTPUT_H = 1200, 675
-DEFAULT_QUALITY = 82
+API_IMAGE_SIZE = "1536x1024"      # DALL·E supported: 1024x1024, 1024x1536, 1536x1024, or "auto"
+OUTPUT_W, OUTPUT_H = 1200, 675    # final blog size
+DEFAULT_QUALITY = 82              # WebP quality (70–82 is good)
 
+# ---------- helpers ----------
 def slugify(text: str) -> str:
     t = text.lower().strip()
     t = re.sub(r"[’'`]", "", t)
@@ -42,7 +43,8 @@ def crop_to_aspect(img: Image.Image, target_w: int, target_h: int) -> Image.Imag
 def save_webp_bytes(img: Image.Image, w: int, h: int, quality: int) -> bytes:
     img = img.convert("RGB")
     img = crop_to_aspect(img, w, h).resize((w, h), Image.LANCZOS)
-    buf = io.BytesIO(); img.save(buf, "WEBP", quality=quality, method=6)
+    buf = io.BytesIO()
+    img.save(buf, "WEBP", quality=quality, method=6)
     return buf.getvalue()
 
 def build_prompt(site: str, keyword: str) -> str:
@@ -78,20 +80,24 @@ def dalle_generate_image_b64(prompt: str, size: str, api_key: str) -> bytes:
         "model": "gpt-image-1",
         "prompt": prompt,
         "size": size,
-        "response_format": "b64_json"   # <- key change
+        "response_format": "b64_json"
     }
-    r = requests.post("https://api.openai.com/v1/images/generations", headers=headers, json=payload, timeout=120)
+    r = requests.post("https://api.openai.com/v1/images/generations",
+                      headers=headers, json=payload, timeout=120)
     if r.status_code != 200:
         raise RuntimeError(f"OpenAI error {r.status_code}: {r.text}")
     b64 = r.json()["data"][0]["b64_json"]
     return base64.b64decode(b64)  # PNG bytes
 
+# ---------- UI ----------
 st.title("Bulk Blog Image Generator (1200×675 WebP)")
 st.caption("Paste keywords (one per line). Generates DALL·E images, crops to 1200×675, then lets you download a ZIP.")
 
+# Optional password gate
 if APP_PASSWORD:
     pwd = st.text_input("Team password", type="password")
-    if pwd != APP_PASSWORD: st.stop()
+    if pwd != APP_PASSWORD:
+        st.stop()
 
 with st.sidebar:
     site = st.selectbox("Site style", list(SITE_PROFILES.keys()),
@@ -99,35 +105,60 @@ with st.sidebar:
     quality = st.slider("WebP quality", 60, 95, DEFAULT_QUALITY)
     size = st.selectbox("DALL·E render size", ["1536x1024","1024x1536","1024x1024"], index=0)
 
-keywords_text = st.text_area("Keywords (one per line)", height=240,
-                             placeholder="Where to Stay in Vail\nWhat County is Vail Colorado in\nWhen Do Vail Back Bowls Open")
-user_api_key = st.text_input("Enter your OpenAI API key", type="password", help="Each user can use their own key.")
+keywords_text = st.text_area(
+    "Keywords (one per line)", height=240,
+    placeholder="Where to Stay in Vail\nWhat County is Vail Colorado in\nWhen Do Vail Back Bowls Open"
+)
+user_api_key = st.text_input("Enter your OpenAI API key", type="password",
+                             help="Each user can use their own key.")
 
 col1, col2 = st.columns([1,1])
-run_btn = col1.button("Generate Images"); clear_btn = col2.button("Clear")
-if clear_btn: st.session_state.clear(); st.experimental_rerun()
+run_btn = col1.button("Generate Images")
+clear_btn = col2.button("Clear")
+if clear_btn:
+    st.session_state.clear()
+    st.experimental_rerun()
 
 if run_btn:
-    if not user_api_key: st.warning("Please enter your OpenAI API key."); st.stop()
+    if not user_api_key:
+        st.warning("Please enter your OpenAI API key.")
+        st.stop()
     keywords: List[str] = [ln.strip() for ln in keywords_text.splitlines() if ln.strip()]
-    if not keywords: st.warning("Please paste at least one keyword."); st.stop()
+    if not keywords:
+        st.warning("Please paste at least one keyword.")
+        st.stop()
 
-    progress = st.progress(0); status = st.empty()
-    zip_buf = io.BytesIO(); zipf = zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED)
+    progress = st.progress(0)
+    status = st.empty()
+    zip_buf = io.BytesIO()
+    zipf = zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED)
     thumbs = []
+
     for i, kw in enumerate(keywords, start=1):
         try:
-            slug = slugify(kw); status.text(f"Generating {i}/{len(keywords)}: {kw}")
-            url = dalle_generate_url(build_prompt(site, kw), size, user_api_key)
-            img = Image.open(io.BytesIO(requests.get(url, timeout=90).content))
-            webp = save_webp_bytes(img, OUTPUT_W, OUTPUT_H, quality)
-            zipf.writestr(f"{slug}.webp", webp); thumbs.append((f"{slug}.webp", webp))
+            slug = slugify(kw)
+            status.text(f"Generating {i}/{len(keywords)}: {kw}")
+
+            # Generate via base64 → no external URL fetching
+            png_bytes = dalle_generate_image_b64(build_prompt(site, kw), size, user_api_key)
+            img = Image.open(io.BytesIO(png_bytes))
+
+            # Convert to 1200×675 WebP and add to ZIP
+            webp_bytes = save_webp_bytes(img, OUTPUT_W, OUTPUT_H, quality)
+            zipf.writestr(f"{slug}.webp", webp_bytes)
+            thumbs.append((f"{slug}.webp", webp_bytes))
         except Exception as e:
             st.error(f"{kw}: {e}")
-        progress.progress(i/len(keywords))
-    zipf.close(); zip_buf.seek(0); st.success("Done! Download your images below.")
+
+        progress.progress(i / len(keywords))
+
+    zipf.close()
+    zip_buf.seek(0)
+
+    st.success("Done! Download your images below.")
     st.download_button("⬇️ Download ZIP", data=zip_buf,
                        file_name=f"{slugify(site)}_images.zip", mime="application/zip")
+
     st.markdown("### Preview & individual downloads")
     cols = st.columns(3)
     for idx, (fname, data_bytes) in enumerate(thumbs):
