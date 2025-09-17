@@ -1,9 +1,8 @@
-# ImageForge Autopilot v2.4.0 — Simple
-# Rule-light bulk image generation for blogs (1200×675 WebP).
-# - AI Planner + Critic craft concise, brand-safe prompts
-# - Optional SerpAPI: reference cues (from image titles only) for ALL keywords,
-#   and price facts hint for pricing queries (never rendered as text)
-# - Per-image downloads + ZIP export
+# ImageForge Autopilot v2.4.1 — Season-aware
+# 1200×675 WebP bulk generator with:
+# - Planner + Critic prompts
+# - Optional SerpAPI reference cues (image titles only) + price facts hint
+# - NEW: Season Engine (month words -> site-specific visuals; Vail April => late-season skiing)
 #
 # Requirements: streamlit, requests, pillow
 # Optional Secrets: OPENAI_API_KEY, SERPAPI_API_KEY, APP_PASSWORD
@@ -23,7 +22,7 @@ import streamlit as st
 # App identity & config
 # =========================
 APP_NAME = "ImageForge Autopilot"
-APP_VERSION = "v2.4.0 — Simple"
+APP_VERSION = "v2.4.1 — Season-aware"
 
 st.set_page_config(page_title=f"{APP_NAME} — {APP_VERSION}", layout="wide")
 
@@ -41,7 +40,7 @@ SITE_PRESETS = {
 }
 
 API_IMAGE_SIZE_OPTIONS = ["1536x1024", "1024x1024", "1024x1536"]  # supported by gpt-image-1
-OUT_W, OUT_H = 1200, 675       # Blog target
+OUT_W, OUT_H = 1200, 675
 DEFAULT_QUALITY = 82
 
 # =========================
@@ -75,7 +74,6 @@ def to_webp_bytes(img: Image.Image, w: int, h: int, quality: int) -> bytes:
     return buf.getvalue()
 
 def extract_json(txt: str):
-    """Parse JSON possibly wrapped in code fences."""
     m = re.search(r"\{.*\}", txt, re.DOTALL)
     if not m:
         return None
@@ -117,7 +115,7 @@ def generate_image_bytes(api_key: str, prompt: str, size: str) -> bytes:
     raise RuntimeError("No image data returned")
 
 # =========================
-# (Optional) SerpAPI helpers
+# SerpAPI helpers (optional)
 # =========================
 SERPAPI_DEFAULT = st.secrets.get("SERPAPI_API_KEY", "")
 
@@ -131,7 +129,6 @@ def keyword_is_pricey(k: str) -> bool:
     return any(term in kk for term in PRICE_TERMS)
 
 def serpapi_price_hint(api_key: str, query: str) -> Optional[str]:
-    """Quick search hint for pricing-ish queries. Returns a short text or None."""
     try:
         url = "https://serpapi.com/search.json"
         params = {"engine": "google", "q": query, "num": 5, "api_key": api_key}
@@ -165,18 +162,17 @@ def serpapi_price_hint(api_key: str, query: str) -> Optional[str]:
         return None
 
 def serpapi_image_titles(api_key: str, query: str, cc_only: bool = True, max_items: int = 6) -> List[str]:
-    """Return a list of image titles from Google Images results via SerpAPI (no downloading)."""
     try:
         url = "https://serpapi.com/search.json"
         params = {
             "engine": "google",
             "q": query,
-            "tbm": "isch",   # image search
+            "tbm": "isch",
             "ijn": "0",
             "api_key": api_key
         }
         if cc_only:
-            params["tbs"] = "sur:fc"  # Creative Commons filter
+            params["tbs"] = "sur:fc"
         r = requests.get(url, params=params, timeout=20)
         if r.status_code != 200:
             return []
@@ -192,7 +188,6 @@ def serpapi_image_titles(api_key: str, query: str, cc_only: bool = True, max_ite
         return []
 
 def summarize_titles_to_cues(openai_key: str, keyword: str, titles: List[str]) -> List[str]:
-    """Use GPT to convert raw image titles into neutral visual cues (no brands/text)."""
     if not titles:
         return []
     sys = (
@@ -213,64 +208,140 @@ def summarize_titles_to_cues(openai_key: str, keyword: str, titles: List[str]) -
     return cues[:6]
 
 # =========================
+# Season Engine (NEW)
+# =========================
+
+MONTH_ALIASES = {
+    "january":"jan", "february":"feb", "march":"mar", "april":"apr", "may":"may", "june":"jun",
+    "july":"jul", "august":"aug", "september":"sep", "october":"oct", "november":"nov", "december":"dec",
+    "jan":"jan","feb":"feb","mar":"mar","apr":"apr","jun":"jun","jul":"jul","aug":"aug","sep":"sep","oct":"oct","nov":"nov","dec":"dec"
+}
+
+def extract_month_token(text: str) -> Optional[str]:
+    t = text.lower()
+    for word in re.findall(r"[a-z]+", t):
+        if word in MONTH_ALIASES:
+            return MONTH_ALIASES[word]
+    return None
+
+def skiish(keyword: str) -> bool:
+    k = keyword.lower()
+    return any(s in k for s in [
+        "ski", "back bowl", "lift ticket", "gondola", "powder", "snowboard", "chairlift"
+    ])
+
+def season_hint_for_site(site_key: str, keyword: str) -> Optional[str]:
+    """Return a strong season directive if we can infer it from the month and site."""
+    m = extract_month_token(keyword)
+    k = keyword.lower()
+
+    # Vail-focused rules (most critical)
+    if site_key == "vailvacay.com":
+        # If ski-ish at any time, force winter scene
+        if skiish(k):
+            return ("Season: winter skiing. Show snowy runs and operating lifts; dressed-for-winter visitors. "
+                    "No summer flowers or green meadows.")
+        if m in {"nov","dec","jan","feb","mar","apr"}:
+            # April tends to be spring skiing; still snow on runs.
+            if m == "apr":
+                return ("Season: late-season spring skiing. Snowy ski runs with skiers; lifts operating; "
+                        "sunny is fine but avoid summer wildflowers and lush green meadows.")
+            return ("Season: winter. Snow on ski slopes, winter clothing, lift infrastructure active.")
+        if m == "may":
+            return ("Season: shoulder. Some snow on high peaks is fine, town mostly thawed; "
+                    "avoid full-summer flowers; if activity relates to skiing, keep snow on runs.")
+        if m in {"jun","jul","aug"}:
+            return ("Season: summer. No snow in town; high peaks may have small patches only.")
+        if m in {"sep"}:
+            return ("Season: early fall. Greens fading; minimal or no snow except high peaks.")
+        if m in {"oct"}:
+            return ("Season: fall with aspens turning; possible light snow dusting on peaks; no active skiing unless keyword says so.")
+        # No month, but if keyword mentions "winter", "summer", etc.
+        if "winter" in k:
+            return "Season: winter. Snowy slopes and winter clothing."
+        if "summer" in k:
+            return "Season: summer. No snow in town."
+        if "spring" in k:
+            return "Season: spring in mountains; snow may persist on runs/high peaks."
+
+    # Boston rough rules (optional)
+    if site_key == "bostonvacay.com" and m:
+        if m in {"dec","jan","feb"}:
+            return "Season: Boston winter; cold-weather outfits; snow streetscape optional."
+        if m in {"jun","jul","aug"}:
+            return "Season: summer by the harbor/Charles; leafy trees; no snow."
+        if m in {"sep","oct"}:
+            return "Season: fall; foliage tones; jackets."
+        if m in {"apr","may"}:
+            return "Season: spring; light jackets; blooming trees."
+
+    # Bangkok (always warm)
+    if site_key == "bangkokvacay.com":
+        return "Season: tropical warm; no coats or winter scenes."
+
+    return None
+
+# =========================
 # Planner + Critic
 # =========================
 
 PLANNER_BASE = """
 You are a senior creative director writing photorealistic image briefs
 for a travel/consumer blog. Given a keyword and a site vibe, craft ONE concise prompt
-(1–2 sentences) for a DALLE-like model. Infer season, indoor/outdoor, and obvious visual
-cues so the topic is unmistakable. Use editorial stock-photo style.
+(1–2 sentences) for a DALLE-like model. Infer obvious visual cues so the topic is unmistakable.
+Use editorial stock-photo style.
 
 Hard constraints (always include as plain text in the prompt):
 - No text/typography overlays, no readable logos or brand marks, privacy-respecting, non-explicit.
 - Balanced composition, natural light, landscape orientation.
 
-Pattern nudges for question-style keywords (examples, not outputs):
-- "what county is …": prefer a tabletop regional map with a pin near the destination, a hand placing the pin; OR an exterior of the county courthouse with the seal out of focus. Avoid readable text.
-- "what river runs through …": make the river the hero (close/mid view of the water through town), with the place context secondary.
-- "what mountain range is … in": emphasize defining ridgelines/peaks; town minimal.
-- "how far is … from …": travel-planning vibe (map with two pinned points or dashboard/GPS scene); avoid readable text.
+Pattern nudges (examples, not outputs):
+- "what county is …": tabletop regional map with a pin near the destination OR exterior of county courthouse with seal out of focus (no readable text).
+- "what river runs through …": make the river the hero; town context secondary.
+- "what mountain range is … in": emphasize ridgelines/peaks; town minimal.
+- "how far is … from …": travel-planning vibe (map with two pinned points or dashboard/GPS angle); avoid readable text.
 
 Price/cost/ticket keywords:
 - Depict a conceptual price-checking or planning scene (ticket window with blurred board, phone with out-of-focus checkout page, pass + gloves on a counter).
-- Absolutely do not render readable numbers, prices, or legible signage. Blur or angle any displays so details are unreadable.
+- Absolutely do not render readable numbers, prices, or legible signage.
 """
 
 SITE_NUDGES = {
     "vailvacay.com": [
         "Snow topics: if ski/back bowls/lift tickets appear, winter conditions are natural; think snowy slopes and lift infrastructure.",
-        "For lift-ticket/gondola price topics: show conceptual scene only (blurred board or phone screen); never readable numbers."
+        "For lift-ticket/gondola price topics: conceptual scene only (blurred board/phone); never readable numbers."
     ],
     "bostonvacay.com": [
-        "Ferry/Bar Harbor trips: boarding ramp or terminal scene with vessel in frame; signage generic/debranded.",
-        "Wardrobe seasons: show layered outfits appropriate to the month; no visible logos.",
-        "Birthday freebies: cozy café/pastry counter, treat on a plate; point-of-sale blurred; no readable signage.",
+        "Ferry/Bar Harbor: boarding ramp or terminal scene with vessel in frame; signage generic/debranded.",
+        "Wardrobe seasons: layered outfits appropriate to month; no visible logos.",
+        "Birthday freebies: café/pastry counter; POS blurred; no readable signage.",
     ],
     "bangkokvacay.com": [
-        "BTS/Chinatown: BTS platform with arriving train; wayfinding shapes/colors suggestive but unreadable; Chinatown lanterns hinted.",
-        "Passport/visa photo: small studio corner with backdrop + softbox + tripod; no brands.",
-        "Nightlife terms: exterior cabaret entrance / neon street scene; silhouettes only; non-explicit.",
+        "BTS/Chinatown: BTS platform with arriving train; wayfinding shapes/colors suggestive but unreadable; Chinatown lantern hints.",
+        "Passport/visa photo: simple studio corner with backdrop + softbox + tripod; no brands.",
+        "Nightlife: exterior/neon street scene; silhouettes; non-explicit.",
     ],
     "ipetzo.com": [
-        "Dog-friendly: owner with dog on patio or lobby seating; water bowl; no hotel branding.",
-        "Indoor pet activities: living-room play scene, toys/bed visible; natural light; no brand marks.",
+        "Dog-friendly: owner with dog on patio/lobby seating; water bowl; no hotel branding.",
+        "Indoor pet activities: living-room play scene; no brand marks.",
     ],
     "1-800deals.com": [
-        "Unboxing/deals/coupons: generic parcels and product tableaus; device screens/descriptive labels out-of-focus; blank shipping labels; no trademarks.",
+        "Unboxing/deals/coupons: generic parcels/product tableaus; device screens out-of-focus; no trademarks.",
     ],
 }
 
-def build_planner_system(site_key: str, facts_hint: Optional[str], ref_cues: List[str]) -> str:
+def build_planner_system(site_key: str, facts_hint: Optional[str], ref_cues: List[str], season_hint: Optional[str]) -> str:
     nudges = SITE_NUDGES.get(site_key, [])
     site_block = "\nSite-specific nudges:\n- " + "\n- ".join(nudges) + "\n" if nudges else ""
     facts_block = f"\nContext (for concept only; do NOT render text or numbers):\n- {facts_hint}\n" if facts_hint else ""
+    season_block = f"\nSeason directive (must follow):\n- {season_hint}\n" if season_hint else ""
     cues_block = ""
     if ref_cues:
         cues_block = "\nReference cues (from public image titles; inspiration only, do not copy layouts; no text/logos):\n- " + "\n- ".join(ref_cues[:6]) + "\n"
     return (
         PLANNER_BASE
         + site_block
+        + season_block
         + facts_block
         + cues_block
         + '\nOutput JSON ONLY:\n{"prompt": "<final one- or two-sentence prompt>"}'
@@ -281,6 +352,7 @@ You are a prompt critic. Given a keyword and a proposed image prompt,
 decide if the prompt obviously covers the keyword. If missing, revise succinctly.
 Keep style constraints intact (no text/logos, non-explicit; balanced composition; landscape).
 For price/cost/ticket topics, ensure it forbids readable numbers/prices/signage and uses a conceptual scene.
+Respect any explicit season directive (e.g., 'late-season spring skiing' implies snowy ski runs and operating lifts; avoid summer wildflowers).
 Use provided reference cues only as inspiration; do not copy layouts or text.
 Output JSON ONLY:
 - If OK: {"action":"ok"}
@@ -288,14 +360,14 @@ Output JSON ONLY:
 """
 
 def plan_prompt(api_key: str, site_vibe: str, keyword: str, site_key: str,
-                facts_hint: Optional[str], ref_cues: List[str]) -> str:
-    planner_system = build_planner_system(site_key, facts_hint, ref_cues)
+                facts_hint: Optional[str], ref_cues: List[str], season_hint: Optional[str]) -> str:
+    planner_system = build_planner_system(site_key, facts_hint, ref_cues, season_hint)
     user = f"""Site vibe: {site_vibe}
 Keyword: {keyword}
 
 Write one photorealistic travel-blog prompt that:
 - Clearly signals the topic with obvious visual cues
-- Chooses indoor vs outdoor and season naturally from the keyword
+- Chooses indoor vs outdoor and season naturally (and obeys the season directive if provided)
 - Stays safe and brand-neutral
 - Is concise (max ~2 sentences)"""
     content = chat_completion(api_key, [
@@ -324,9 +396,9 @@ def critique_and_refine(api_key: str, keyword: str, prompt: str) -> str:
 # UI
 # =========================
 st.title(f"{APP_NAME} — {APP_VERSION}")
-st.caption("Paste keywords (one per line). Planner + Critic craft brand-safe prompts. "
-           "If you add a SerpAPI key, we use reference cues for all keywords and a price facts hint for price queries (never rendered as text). "
-           "Output: 1200×675 WebP, ZIP + per-image downloads.")
+st.caption("Paste keywords (one per line). Optional SerpAPI adds reference cues (image titles only) and price hints. "
+           "The Season Engine infers month from the keyword (e.g., 'April in Vail') and enforces the right visuals "
+           "(e.g., snowy late-season skiing in April). Output: 1200×675 WebP, ZIP + per-image downloads.")
 
 if APP_PASSWORD:
     gate = st.text_input("Team password", type="password")
@@ -339,7 +411,7 @@ with st.sidebar:
     quality = st.slider("WebP quality", 60, 95, DEFAULT_QUALITY)
     render_size = st.selectbox("Render size", API_IMAGE_SIZE_OPTIONS, index=0)
     serpapi_key = st.text_input("SERPAPI_API_KEY (optional)", type="password",
-                                value=SERPAPI_DEFAULT, help="If provided, we add reference cues for all keywords and price hints for price queries.")
+                                value=SERPAPI_DEFAULT, help="Adds reference cues and price hints.")
 
 openai_key = st.text_input(
     "OpenAI API key",
@@ -351,7 +423,7 @@ openai_key = st.text_input(
 keywords_text = st.text_area(
     "Keywords (one per line)",
     height=280,
-    placeholder="best seafood restaurant in Boston\nwhat county is Vail\nhow much are lift tickets at Vail\nBTS to Chinatown Bangkok\ndog friendly hotel in Vail",
+    placeholder="things to do in Vail in April\nbest seafood restaurant in Boston\nwhat county is Vail\nlift ticket price Vail",
 )
 
 c1, c2 = st.columns(2)
@@ -370,13 +442,16 @@ def do_one(api_key: str, keyword: str, site_key: str, render_size: str, quality:
     """
     site_vibe = SITE_PRESETS.get(site_key, SITE_PRESETS[DEFAULT_SITE])
 
-    # (Optional) SerpAPI: price facts hint for price-y queries
+    # Season directive from keyword + site
+    season_hint = season_hint_for_site(site_key, keyword)
+
+    # SerpAPI price facts (only for price-like queries)
     facts_hint = None
     if serpapi_key and keyword_is_pricey(keyword):
         q = f"{keyword} {site_key.split('.')[0]}"
         facts_hint = serpapi_price_hint(serpapi_key, q)
 
-    # (Optional) SerpAPI: reference cues via image titles (always try if key provided)
+    # SerpAPI reference cues (image titles -> cues)
     ref_titles: List[str] = []
     ref_cues: List[str] = []
     if serpapi_key:
@@ -384,13 +459,13 @@ def do_one(api_key: str, keyword: str, site_key: str, render_size: str, quality:
         ref_titles = serpapi_image_titles(serpapi_key, q, cc_only=True, max_items=5)
         ref_cues = summarize_titles_to_cues(api_key, keyword, ref_titles) if ref_titles else []
 
-    # 1) Planner
-    base_prompt = plan_prompt(api_key, site_vibe, keyword, site_key, facts_hint, ref_cues)
+    # Planner
+    base_prompt = plan_prompt(api_key, site_vibe, keyword, site_key, facts_hint, ref_cues, season_hint)
 
-    # 2) Critic (single-pass refine if needed)
+    # Critic (single pass)
     final_prompt = critique_and_refine(api_key, keyword, base_prompt)
 
-    # 3) Image
+    # Image
     png = generate_image_bytes(api_key, final_prompt, render_size)
     img = Image.open(io.BytesIO(png))
     return final_prompt, to_webp_bytes(img, OUT_W, OUT_H, quality), facts_hint, ref_titles, ref_cues
@@ -408,9 +483,9 @@ if run:
     prog = st.progress(0)
     status = st.empty()
     thumbs: List[Tuple[str, bytes]] = []
-    prompts_used: List[Tuple[str, str]] = []     # (fname, prompt)
-    facts_notes: List[Tuple[str, str]] = []      # (fname, facts_hint)
-    ref_notes: List[Tuple[str, List[str], List[str]]] = []  # (fname, titles, cues)
+    prompts_used: List[Tuple[str, str]] = []
+    facts_notes: List[Tuple[str, str]] = []
+    ref_notes: List[Tuple[str, List[str], List[str]]] = []
 
     zip_buf = io.BytesIO()
     zipf = zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED)
@@ -452,7 +527,7 @@ if run:
                 st.download_button("Download", data=data_bytes, file_name=fname,
                                    mime="image/webp", key=f"dl_{idx}")
 
-        with st.expander("Prompts used (for QA)"):
+        with st.expander("Prompts used (QA)"):
             for fname, p in prompts_used:
                 st.markdown(f"**{fname}**")
                 st.code(p, language="text")
@@ -464,7 +539,7 @@ if run:
                     st.write(note)
 
         if ref_notes:
-            with st.expander("Reference cues (from public image titles)"):
+            with st.expander("Reference cues (public image titles)"):
                 st.write("Used as inspiration only; no external images were downloaded.")
                 for fname, titles, cues in ref_notes:
                     st.markdown(f"**{fname}**")
