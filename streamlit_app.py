@@ -1,8 +1,10 @@
-# ImageForge Autopilot v2.4.1 — Season-aware
+# ImageForge Autopilot v2.5.0 — Corridor-aware
 # 1200×675 WebP bulk generator with:
 # - Planner + Critic prompts
 # - Optional SerpAPI reference cues (image titles only) + price facts hint
-# - NEW: Season Engine (month words -> site-specific visuals; Vail April => late-season skiing)
+# - Season Engine (month words -> site-specific visuals; e.g., Vail April => late-season skiing)
+# - NEW: Corridor Engine for "between A and B" / "from A to B" queries
+#   -> forces road-trip visuals and, for Vail<->Albuquerque, a Southwest palette; forbids resort artifacts
 #
 # Requirements: streamlit, requests, pillow
 # Optional Secrets: OPENAI_API_KEY, SERPAPI_API_KEY, APP_PASSWORD
@@ -22,7 +24,7 @@ import streamlit as st
 # App identity & config
 # =========================
 APP_NAME = "ImageForge Autopilot"
-APP_VERSION = "v2.4.1 — Season-aware"
+APP_VERSION = "v2.5.0 — Corridor-aware"
 
 st.set_page_config(page_title=f"{APP_NAME} — {APP_VERSION}", layout="wide")
 
@@ -208,7 +210,7 @@ def summarize_titles_to_cues(openai_key: str, keyword: str, titles: List[str]) -
     return cues[:6]
 
 # =========================
-# Season Engine (NEW)
+# Season Engine
 # =========================
 
 MONTH_ALIASES = {
@@ -231,18 +233,14 @@ def skiish(keyword: str) -> bool:
     ])
 
 def season_hint_for_site(site_key: str, keyword: str) -> Optional[str]:
-    """Return a strong season directive if we can infer it from the month and site."""
     m = extract_month_token(keyword)
     k = keyword.lower()
 
-    # Vail-focused rules (most critical)
     if site_key == "vailvacay.com":
-        # If ski-ish at any time, force winter scene
         if skiish(k):
             return ("Season: winter skiing. Show snowy runs and operating lifts; dressed-for-winter visitors. "
                     "No summer flowers or green meadows.")
         if m in {"nov","dec","jan","feb","mar","apr"}:
-            # April tends to be spring skiing; still snow on runs.
             if m == "apr":
                 return ("Season: late-season spring skiing. Snowy ski runs with skiers; lifts operating; "
                         "sunny is fine but avoid summer wildflowers and lush green meadows.")
@@ -256,7 +254,6 @@ def season_hint_for_site(site_key: str, keyword: str) -> Optional[str]:
             return ("Season: early fall. Greens fading; minimal or no snow except high peaks.")
         if m in {"oct"}:
             return ("Season: fall with aspens turning; possible light snow dusting on peaks; no active skiing unless keyword says so.")
-        # No month, but if keyword mentions "winter", "summer", etc.
         if "winter" in k:
             return "Season: winter. Snowy slopes and winter clothing."
         if "summer" in k:
@@ -264,7 +261,6 @@ def season_hint_for_site(site_key: str, keyword: str) -> Optional[str]:
         if "spring" in k:
             return "Season: spring in mountains; snow may persist on runs/high peaks."
 
-    # Boston rough rules (optional)
     if site_key == "bostonvacay.com" and m:
         if m in {"dec","jan","feb"}:
             return "Season: Boston winter; cold-weather outfits; snow streetscape optional."
@@ -275,11 +271,57 @@ def season_hint_for_site(site_key: str, keyword: str) -> Optional[str]:
         if m in {"apr","may"}:
             return "Season: spring; light jackets; blooming trees."
 
-    # Bangkok (always warm)
     if site_key == "bangkokvacay.com":
         return "Season: tropical warm; no coats or winter scenes."
 
     return None
+
+# =========================
+# Corridor Engine (NEW)
+# =========================
+
+ROUTE_SW_KEYWORDS = [
+    "albuquerque", "santa fe", "taos", "new mexico", "nm",
+    "rio grande", "gorge", "mesa", "pueblo", "adobe", "sand dunes", "great sand dunes"
+]
+
+def parse_route_endpoints(keyword: str) -> Optional[Tuple[str, str]]:
+    k = " ".join(keyword.lower().split())
+    # between A and B
+    m = re.search(r"between\s+(.+?)\s+and\s+(.+)$", k)
+    if m:
+        return m.group(1).strip(), m.group(2).strip()
+    # from A to B
+    m = re.search(r"from\s+(.+?)\s+to\s+(.+)$", k)
+    if m:
+        return m.group(1).strip(), m.group(2).strip()
+    return None
+
+def corridor_hint_for_route(site_key: str, keyword: str) -> Optional[str]:
+    """If it's a corridor query, return a directive forcing road-trip visuals."""
+    endpoints = parse_route_endpoints(keyword)
+    if not endpoints:
+        # handle 'to' patterns like 'things to see vail to albuquerque'
+        if re.search(r"\bto\b", keyword.lower()) and ("between" in keyword.lower() or "from" in keyword.lower()):
+            pass
+        else:
+            return None
+
+    k = keyword.lower()
+    # Generic road-trip directive
+    generic = (
+        "Road-trip corridor scene: emphasize highway or scenic overlook, or a dash/map angle. "
+        "Use brown park sign or mile marker in soft focus. Keep brand signage unreadable. "
+        "Avoid resort-only artifacts such as gondolas, chairlifts, and base lodges."
+    )
+
+    # Vail <-> Albuquerque / Southwest flavor
+    if any(sw in k for sw in ROUTE_SW_KEYWORDS) or ("vail" in k and "albuquerque" in k):
+        return (generic + " Southwest palette: sagebrush and piñon-juniper, red/orange mesas, adobe or Spanish-style town hints; "
+                "optional icons like Rio Grande Gorge Bridge or Great Sand Dunes in the distance. No alpine gondolas.")
+
+    # Else: just enforce road-trip without regional palette
+    return generic
 
 # =========================
 # Planner + Critic
@@ -299,11 +341,7 @@ Pattern nudges (examples, not outputs):
 - "what county is …": tabletop regional map with a pin near the destination OR exterior of county courthouse with seal out of focus (no readable text).
 - "what river runs through …": make the river the hero; town context secondary.
 - "what mountain range is … in": emphasize ridgelines/peaks; town minimal.
-- "how far is … from …": travel-planning vibe (map with two pinned points or dashboard/GPS angle); avoid readable text.
-
-Price/cost/ticket keywords:
-- Depict a conceptual price-checking or planning scene (ticket window with blurred board, phone with out-of-focus checkout page, pass + gloves on a counter).
-- Absolutely do not render readable numbers, prices, or legible signage.
+- "how far/between/from A to B": road-trip planning vibe (two-lane highway or scenic overlook; optional dashboard/map angle); avoid readable text or brand signage.
 """
 
 SITE_NUDGES = {
@@ -330,11 +368,16 @@ SITE_NUDGES = {
     ],
 }
 
-def build_planner_system(site_key: str, facts_hint: Optional[str], ref_cues: List[str], season_hint: Optional[str]) -> str:
+def build_planner_system(site_key: str,
+                         facts_hint: Optional[str],
+                         ref_cues: List[str],
+                         season_hint: Optional[str],
+                         corridor_hint: Optional[str]) -> str:
     nudges = SITE_NUDGES.get(site_key, [])
     site_block = "\nSite-specific nudges:\n- " + "\n- ".join(nudges) + "\n" if nudges else ""
     facts_block = f"\nContext (for concept only; do NOT render text or numbers):\n- {facts_hint}\n" if facts_hint else ""
     season_block = f"\nSeason directive (must follow):\n- {season_hint}\n" if season_hint else ""
+    corridor_block = f"\nCorridor directive (must follow):\n- {corridor_hint}\n" if corridor_hint else ""
     cues_block = ""
     if ref_cues:
         cues_block = "\nReference cues (from public image titles; inspiration only, do not copy layouts; no text/logos):\n- " + "\n- ".join(ref_cues[:6]) + "\n"
@@ -342,6 +385,7 @@ def build_planner_system(site_key: str, facts_hint: Optional[str], ref_cues: Lis
         PLANNER_BASE
         + site_block
         + season_block
+        + corridor_block
         + facts_block
         + cues_block
         + '\nOutput JSON ONLY:\n{"prompt": "<final one- or two-sentence prompt>"}'
@@ -352,7 +396,9 @@ You are a prompt critic. Given a keyword and a proposed image prompt,
 decide if the prompt obviously covers the keyword. If missing, revise succinctly.
 Keep style constraints intact (no text/logos, non-explicit; balanced composition; landscape).
 For price/cost/ticket topics, ensure it forbids readable numbers/prices/signage and uses a conceptual scene.
-Respect any explicit season directive (e.g., 'late-season spring skiing' implies snowy ski runs and operating lifts; avoid summer wildflowers).
+Respect any explicit season directive (e.g., 'late-season spring skiing').
+If a corridor directive is present, you MUST depict a road-trip scene (highway/overlook or dash+map angle)
+and you MUST avoid resort artifacts such as gondolas, chairlifts, base lodges; add regional palette if specified.
 Use provided reference cues only as inspiration; do not copy layouts or text.
 Output JSON ONLY:
 - If OK: {"action":"ok"}
@@ -360,14 +406,16 @@ Output JSON ONLY:
 """
 
 def plan_prompt(api_key: str, site_vibe: str, keyword: str, site_key: str,
-                facts_hint: Optional[str], ref_cues: List[str], season_hint: Optional[str]) -> str:
-    planner_system = build_planner_system(site_key, facts_hint, ref_cues, season_hint)
+                facts_hint: Optional[str], ref_cues: List[str],
+                season_hint: Optional[str], corridor_hint: Optional[str]) -> str:
+    planner_system = build_planner_system(site_key, facts_hint, ref_cues, season_hint, corridor_hint)
     user = f"""Site vibe: {site_vibe}
 Keyword: {keyword}
 
 Write one photorealistic travel-blog prompt that:
 - Clearly signals the topic with obvious visual cues
-- Chooses indoor vs outdoor and season naturally (and obeys the season directive if provided)
+- Chooses indoor vs outdoor and season naturally (and obeys directives if provided)
+- Uses road-trip visuals for corridor queries
 - Stays safe and brand-neutral
 - Is concise (max ~2 sentences)"""
     content = chat_completion(api_key, [
@@ -397,8 +445,8 @@ def critique_and_refine(api_key: str, keyword: str, prompt: str) -> str:
 # =========================
 st.title(f"{APP_NAME} — {APP_VERSION}")
 st.caption("Paste keywords (one per line). Optional SerpAPI adds reference cues (image titles only) and price hints. "
-           "The Season Engine infers month from the keyword (e.g., 'April in Vail') and enforces the right visuals "
-           "(e.g., snowy late-season skiing in April). Output: 1200×675 WebP, ZIP + per-image downloads.")
+           "Season Engine fixes month visuals; Corridor Engine fixes 'between/from A to B' queries "
+           "(e.g., Vail ↔ Albuquerque → Southwest road-trip, no gondolas). Output: 1200×675 WebP, ZIP + per-image downloads.")
 
 if APP_PASSWORD:
     gate = st.text_input("Team password", type="password")
@@ -423,7 +471,7 @@ openai_key = st.text_input(
 keywords_text = st.text_area(
     "Keywords (one per line)",
     height=280,
-    placeholder="things to do in Vail in April\nbest seafood restaurant in Boston\nwhat county is Vail\nlift ticket price Vail",
+    placeholder="things to see between Vail and Albuquerque\nhow far is Vail from Colorado Springs\nbest seafood restaurant in Boston",
 )
 
 c1, c2 = st.columns(2)
@@ -442,8 +490,11 @@ def do_one(api_key: str, keyword: str, site_key: str, render_size: str, quality:
     """
     site_vibe = SITE_PRESETS.get(site_key, SITE_PRESETS[DEFAULT_SITE])
 
-    # Season directive from keyword + site
+    # Season directive
     season_hint = season_hint_for_site(site_key, keyword)
+
+    # Corridor directive
+    corridor_hint = corridor_hint_for_route(site_key, keyword)
 
     # SerpAPI price facts (only for price-like queries)
     facts_hint = None
@@ -460,7 +511,8 @@ def do_one(api_key: str, keyword: str, site_key: str, render_size: str, quality:
         ref_cues = summarize_titles_to_cues(api_key, keyword, ref_titles) if ref_titles else []
 
     # Planner
-    base_prompt = plan_prompt(api_key, site_vibe, keyword, site_key, facts_hint, ref_cues, season_hint)
+    base_prompt = plan_prompt(api_key, site_vibe, keyword, site_key,
+                              facts_hint, ref_cues, season_hint, corridor_hint)
 
     # Critic (single pass)
     final_prompt = critique_and_refine(api_key, keyword, base_prompt)
