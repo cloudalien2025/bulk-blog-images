@@ -1,10 +1,6 @@
-# ImageForge Autopilot v2.5.0 — Corridor-aware
-# 1200×675 WebP bulk generator with:
-# - Planner + Critic prompts
-# - Optional SerpAPI reference cues (image titles only) + price facts hint
-# - Season Engine (month words -> site-specific visuals; e.g., Vail April => late-season skiing)
-# - NEW: Corridor Engine for "between A and B" / "from A to B" queries
-#   -> forces road-trip visuals and, for Vail<->Albuquerque, a Southwest palette; forbids resort artifacts
+# ImageForge Autopilot v2.6.0 — Pinterest preset
+# Adds an output preset for Pinterest Pins (1000×1500, 2:3) + portrait-oriented prompts.
+# Keeps: Season Engine, Corridor Engine, SerpAPI (optional), ZIP + per-image downloads.
 #
 # Requirements: streamlit, requests, pillow
 # Optional Secrets: OPENAI_API_KEY, SERPAPI_API_KEY, APP_PASSWORD
@@ -24,7 +20,7 @@ import streamlit as st
 # App identity & config
 # =========================
 APP_NAME = "ImageForge Autopilot"
-APP_VERSION = "v2.5.0 — Corridor-aware"
+APP_VERSION = "v2.6.0 — Pinterest preset"
 
 st.set_page_config(page_title=f"{APP_NAME} — {APP_VERSION}", layout="wide")
 
@@ -32,7 +28,7 @@ st.set_page_config(page_title=f"{APP_NAME} — {APP_VERSION}", layout="wide")
 APP_PASSWORD = st.secrets.get("APP_PASSWORD", "")
 DEFAULT_SITE = "vailvacay.com"
 
-# Minimal, brand-safe site vibes (tone/place cues only)
+# Site vibes (brand-safe)
 SITE_PRESETS = {
     "vailvacay.com":  "Colorado alpine resort & village; riverside paths, gondola/base areas, evergreen forests, cozy lodges.",
     "bostonvacay.com":"New England city; Beacon Hill brick, harborwalk, Charles River, landmark stations.",
@@ -41,8 +37,15 @@ SITE_PRESETS = {
     "1-800deals.com":  "Retail/e-commerce; parcels, unboxing, generic products; clean backgrounds.",
 }
 
-API_IMAGE_SIZE_OPTIONS = ["1536x1024", "1024x1024", "1024x1536"]  # supported by gpt-image-1
-OUT_W, OUT_H = 1200, 675
+# DALLE render sizes allowed
+API_IMAGE_SIZE_OPTIONS = ["1536x1024", "1024x1024", "1024x1536"]
+
+# Output presets (final WebP)
+OUTPUT_PRESETS = {
+    "Blog 1200×675 (16:9)": {"w": 1200, "h": 675, "orientation_note": "landscape orientation"},
+    "Pinterest 1000×1500 (2:3)": {"w": 1000, "h": 1500, "orientation_note": "portrait/vertical orientation"},
+}
+DEFAULT_OUTPUT_PRESET = "Blog 1200×675 (16:9)"
 DEFAULT_QUALITY = 82
 
 # =========================
@@ -212,7 +215,6 @@ def summarize_titles_to_cues(openai_key: str, keyword: str, titles: List[str]) -
 # =========================
 # Season Engine
 # =========================
-
 MONTH_ALIASES = {
     "january":"jan", "february":"feb", "march":"mar", "april":"apr", "may":"may", "june":"jun",
     "july":"jul", "august":"aug", "september":"sep", "october":"oct", "november":"nov", "december":"dec",
@@ -277,9 +279,8 @@ def season_hint_for_site(site_key: str, keyword: str) -> Optional[str]:
     return None
 
 # =========================
-# Corridor Engine (NEW)
+# Corridor Engine
 # =========================
-
 ROUTE_SW_KEYWORDS = [
     "albuquerque", "santa fe", "taos", "new mexico", "nm",
     "rio grande", "gorge", "mesa", "pueblo", "adobe", "sand dunes", "great sand dunes"
@@ -287,46 +288,36 @@ ROUTE_SW_KEYWORDS = [
 
 def parse_route_endpoints(keyword: str) -> Optional[Tuple[str, str]]:
     k = " ".join(keyword.lower().split())
-    # between A and B
     m = re.search(r"between\s+(.+?)\s+and\s+(.+)$", k)
     if m:
         return m.group(1).strip(), m.group(2).strip()
-    # from A to B
     m = re.search(r"from\s+(.+?)\s+to\s+(.+)$", k)
     if m:
         return m.group(1).strip(), m.group(2).strip()
     return None
 
 def corridor_hint_for_route(site_key: str, keyword: str) -> Optional[str]:
-    """If it's a corridor query, return a directive forcing road-trip visuals."""
     endpoints = parse_route_endpoints(keyword)
     if not endpoints:
-        # handle 'to' patterns like 'things to see vail to albuquerque'
         if re.search(r"\bto\b", keyword.lower()) and ("between" in keyword.lower() or "from" in keyword.lower()):
             pass
         else:
             return None
 
     k = keyword.lower()
-    # Generic road-trip directive
     generic = (
         "Road-trip corridor scene: emphasize highway or scenic overlook, or a dash/map angle. "
         "Use brown park sign or mile marker in soft focus. Keep brand signage unreadable. "
         "Avoid resort-only artifacts such as gondolas, chairlifts, and base lodges."
     )
-
-    # Vail <-> Albuquerque / Southwest flavor
     if any(sw in k for sw in ROUTE_SW_KEYWORDS) or ("vail" in k and "albuquerque" in k):
         return (generic + " Southwest palette: sagebrush and piñon-juniper, red/orange mesas, adobe or Spanish-style town hints; "
                 "optional icons like Rio Grande Gorge Bridge or Great Sand Dunes in the distance. No alpine gondolas.")
-
-    # Else: just enforce road-trip without regional palette
     return generic
 
 # =========================
 # Planner + Critic
 # =========================
-
 PLANNER_BASE = """
 You are a senior creative director writing photorealistic image briefs
 for a travel/consumer blog. Given a keyword and a site vibe, craft ONE concise prompt
@@ -335,7 +326,7 @@ Use editorial stock-photo style.
 
 Hard constraints (always include as plain text in the prompt):
 - No text/typography overlays, no readable logos or brand marks, privacy-respecting, non-explicit.
-- Balanced composition, natural light, landscape orientation.
+- Balanced composition, natural light, {ORIENTATION_NOTE}.
 
 Pattern nudges (examples, not outputs):
 - "what county is …": tabletop regional map with a pin near the destination OR exterior of county courthouse with seal out of focus (no readable text).
@@ -372,7 +363,8 @@ def build_planner_system(site_key: str,
                          facts_hint: Optional[str],
                          ref_cues: List[str],
                          season_hint: Optional[str],
-                         corridor_hint: Optional[str]) -> str:
+                         corridor_hint: Optional[str],
+                         orientation_note: str) -> str:
     nudges = SITE_NUDGES.get(site_key, [])
     site_block = "\nSite-specific nudges:\n- " + "\n- ".join(nudges) + "\n" if nudges else ""
     facts_block = f"\nContext (for concept only; do NOT render text or numbers):\n- {facts_hint}\n" if facts_hint else ""
@@ -381,8 +373,9 @@ def build_planner_system(site_key: str,
     cues_block = ""
     if ref_cues:
         cues_block = "\nReference cues (from public image titles; inspiration only, do not copy layouts; no text/logos):\n- " + "\n- ".join(ref_cues[:6]) + "\n"
+
     return (
-        PLANNER_BASE
+        PLANNER_BASE.replace("{ORIENTATION_NOTE}", orientation_note)
         + site_block
         + season_block
         + corridor_block
@@ -394,9 +387,9 @@ def build_planner_system(site_key: str,
 CRITIC_SYSTEM = """
 You are a prompt critic. Given a keyword and a proposed image prompt,
 decide if the prompt obviously covers the keyword. If missing, revise succinctly.
-Keep style constraints intact (no text/logos, non-explicit; balanced composition; landscape).
+Keep style constraints intact (no text/logos, non-explicit; balanced composition; obey orientation).
 For price/cost/ticket topics, ensure it forbids readable numbers/prices/signage and uses a conceptual scene.
-Respect any explicit season directive (e.g., 'late-season spring skiing').
+Respect any season directive (e.g., 'late-season spring skiing').
 If a corridor directive is present, you MUST depict a road-trip scene (highway/overlook or dash+map angle)
 and you MUST avoid resort artifacts such as gondolas, chairlifts, base lodges; add regional palette if specified.
 Use provided reference cues only as inspiration; do not copy layouts or text.
@@ -407,8 +400,9 @@ Output JSON ONLY:
 
 def plan_prompt(api_key: str, site_vibe: str, keyword: str, site_key: str,
                 facts_hint: Optional[str], ref_cues: List[str],
-                season_hint: Optional[str], corridor_hint: Optional[str]) -> str:
-    planner_system = build_planner_system(site_key, facts_hint, ref_cues, season_hint, corridor_hint)
+                season_hint: Optional[str], corridor_hint: Optional[str],
+                orientation_note: str) -> str:
+    planner_system = build_planner_system(site_key, facts_hint, ref_cues, season_hint, corridor_hint, orientation_note)
     user = f"""Site vibe: {site_vibe}
 Keyword: {keyword}
 
@@ -444,9 +438,9 @@ def critique_and_refine(api_key: str, keyword: str, prompt: str) -> str:
 # UI
 # =========================
 st.title(f"{APP_NAME} — {APP_VERSION}")
-st.caption("Paste keywords (one per line). Optional SerpAPI adds reference cues (image titles only) and price hints. "
-           "Season Engine fixes month visuals; Corridor Engine fixes 'between/from A to B' queries "
-           "(e.g., Vail ↔ Albuquerque → Southwest road-trip, no gondolas). Output: 1200×675 WebP, ZIP + per-image downloads.")
+st.caption("Choose an output preset (Blog or Pinterest). Pinterest uses a 2:3 vertical crop and portrait-oriented prompts. "
+           "Season Engine fixes month visuals; Corridor Engine fixes 'between/from A to B' queries. "
+           "Optional SerpAPI adds reference cues and price hints. Output: WebP + ZIP + per-image downloads.")
 
 if APP_PASSWORD:
     gate = st.text_input("Team password", type="password")
@@ -456,8 +450,15 @@ if APP_PASSWORD:
 with st.sidebar:
     site = st.selectbox("Site", list(SITE_PRESETS.keys()),
                         index=list(SITE_PRESETS.keys()).index(DEFAULT_SITE))
+    output_preset = st.selectbox("Output preset", list(OUTPUT_PRESETS.keys()),
+                                 index=list(OUTPUT_PRESETS.keys()).index(DEFAULT_OUTPUT_PRESET))
     quality = st.slider("WebP quality", 60, 95, DEFAULT_QUALITY)
-    render_size = st.selectbox("Render size", API_IMAGE_SIZE_OPTIONS, index=0)
+    render_size = st.selectbox(
+        "Model render size (internal)",
+        API_IMAGE_SIZE_OPTIONS,
+        index=0,
+        help="For Pinterest, a vertical render (1024×1536) gives best detail; we auto-switch if needed."
+    )
     serpapi_key = st.text_input("SERPAPI_API_KEY (optional)", type="password",
                                 value=SERPAPI_DEFAULT, help="Adds reference cues and price hints.")
 
@@ -471,7 +472,7 @@ openai_key = st.text_input(
 keywords_text = st.text_area(
     "Keywords (one per line)",
     height=280,
-    placeholder="things to see between Vail and Albuquerque\nhow far is Vail from Colorado Springs\nbest seafood restaurant in Boston",
+    placeholder="things to do in Vail in April\nbest seafood restaurant in Boston\nwhat county is Vail\nthings to see between Vail and Albuquerque",
 )
 
 c1, c2 = st.columns(2)
@@ -483,12 +484,26 @@ if c2.button("Clear"):
 # =========================
 # Run
 # =========================
-def do_one(api_key: str, keyword: str, site_key: str, render_size: str, quality: int,
+def choose_render_size_for_orientation(chosen_size: str, orientation_note: str) -> str:
+    portrait = "portrait" in orientation_note
+    if portrait and chosen_size != "1024x1536":
+        return "1024x1536"
+    if (not portrait) and chosen_size == "1024x1536":
+        return "1536x1024"
+    return chosen_size
+
+def do_one(api_key: str, keyword: str, site_key: str,
+           output_cfg: dict, chosen_render_size: str, quality: int,
            serpapi_key: str) -> Tuple[str, bytes, Optional[str], List[str], List[str]]:
     """
     Returns: (final_prompt, webp_bytes, facts_hint, ref_titles, ref_cues)
     """
     site_vibe = SITE_PRESETS.get(site_key, SITE_PRESETS[DEFAULT_SITE])
+    W, H = output_cfg["w"], output_cfg["h"]
+    orientation_note = output_cfg["orientation_note"]
+
+    # Harmonize render size with orientation
+    render_size = choose_render_size_for_orientation(chosen_render_size, orientation_note)
 
     # Season directive
     season_hint = season_hint_for_site(site_key, keyword)
@@ -511,8 +526,11 @@ def do_one(api_key: str, keyword: str, site_key: str, render_size: str, quality:
         ref_cues = summarize_titles_to_cues(api_key, keyword, ref_titles) if ref_titles else []
 
     # Planner
-    base_prompt = plan_prompt(api_key, site_vibe, keyword, site_key,
-                              facts_hint, ref_cues, season_hint, corridor_hint)
+    base_prompt = plan_prompt(
+        api_key, site_vibe, keyword, site_key,
+        facts_hint, ref_cues, season_hint, corridor_hint,
+        orientation_note
+    )
 
     # Critic (single pass)
     final_prompt = critique_and_refine(api_key, keyword, base_prompt)
@@ -520,7 +538,7 @@ def do_one(api_key: str, keyword: str, site_key: str, render_size: str, quality:
     # Image
     png = generate_image_bytes(api_key, final_prompt, render_size)
     img = Image.open(io.BytesIO(png))
-    return final_prompt, to_webp_bytes(img, OUT_W, OUT_H, quality), facts_hint, ref_titles, ref_cues
+    return final_prompt, to_webp_bytes(img, W, H, quality), facts_hint, ref_titles, ref_cues
 
 if run:
     if not openai_key:
@@ -531,6 +549,8 @@ if run:
     if not kws:
         st.warning("Please paste at least one keyword.")
         st.stop()
+
+    out_cfg = OUTPUT_PRESETS[output_preset]
 
     prog = st.progress(0)
     status = st.empty()
@@ -547,7 +567,7 @@ if run:
         try:
             status.text(f"Generating {i}/{len(kws)}: {kw}")
             prompt_used, webp, facts_hint, ref_titles, ref_cues = do_one(
-                openai_key, kw, site, render_size, quality, serpapi_key
+                openai_key, kw, site, out_cfg, render_size, quality, serpapi_key
             )
             zipf.writestr(fname, webp)
             thumbs.append((fname, webp))
@@ -568,13 +588,13 @@ if run:
     else:
         st.success("Done! Download your images below.")
         st.download_button("⬇️ Download ZIP", data=zip_buf,
-                           file_name=f"{slugify(site)}_images.zip",
+                           file_name=f"{slugify(site)}_{slugify(output_preset)}.zip",
                            mime="application/zip", key="zip")
 
         st.markdown("### Previews")
-        cols = st.columns(3)
+        cols = st.columns(3 if out_cfg['h'] <= out_cfg['w'] else 2)
         for idx, (fname, data_bytes) in enumerate(thumbs):
-            with cols[idx % 3]:
+            with cols[idx % len(cols)]:
                 st.image(data_bytes, caption=fname, use_container_width=True)
                 st.download_button("Download", data=data_bytes, file_name=fname,
                                    mime="image/webp", key=f"dl_{idx}")
