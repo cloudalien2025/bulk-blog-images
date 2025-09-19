@@ -1,6 +1,7 @@
-# ImageForge Autopilot v2.6.0 — Pinterest preset
-# Adds an output preset for Pinterest Pins (1000×1500, 2:3) + portrait-oriented prompts.
-# Keeps: Season Engine, Corridor Engine, SerpAPI (optional), ZIP + per-image downloads.
+# ImageForge Autopilot v2.7.0 — LSI Variants
+# - NEW: "Images per keyword" -> generates N-1 LSI variants per keyword
+# - Keeps: Pinterest/Blog output presets, Season Engine, Corridor Engine
+# - Optional SerpAPI: reference cues (image titles only) + price facts hint
 #
 # Requirements: streamlit, requests, pillow
 # Optional Secrets: OPENAI_API_KEY, SERPAPI_API_KEY, APP_PASSWORD
@@ -10,7 +11,7 @@ import re
 import json
 import base64
 import zipfile
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
 
 import requests
 from PIL import Image
@@ -20,7 +21,7 @@ import streamlit as st
 # App identity & config
 # =========================
 APP_NAME = "ImageForge Autopilot"
-APP_VERSION = "v2.6.0 — Pinterest preset"
+APP_VERSION = "v2.7.0 — LSI Variants"
 
 st.set_page_config(page_title=f"{APP_NAME} — {APP_VERSION}", layout="wide")
 
@@ -435,12 +436,69 @@ def critique_and_refine(api_key: str, keyword: str, prompt: str) -> str:
     return prompt
 
 # =========================
+# LSI generator (NEW)
+# =========================
+def generate_lsi_variants(api_key: str, main_keyword: str, site_key: str, count: int) -> List[str]:
+    """
+    Return up to `count` LSI variants for the main keyword.
+    Rules:
+      - Keep month/season/location context from the main keyword (e.g., 'in October' stays October).
+      - Stay brand-neutral (no specific venues, logos, or people).
+      - Family-safe; travel-blog appropriate; English; concise.
+      - No duplicates of the main keyword; distinct subtopics or angles.
+      - Output JSON ONLY: {"variants": ["...", "..."]}
+    """
+    if count <= 0:
+        return []
+    system = (
+        "You are an SEO-savvy content strategist. Given a main keyword for a travel/consumer blog, "
+        "produce concise LSI (semantically related) keyword variants that would make good separate image briefs. "
+        "Keep any month/season/location from the main keyword unchanged. Avoid brands, explicit content, or personal names. "
+        "Return JSON ONLY as {\"variants\": [\"...\"]}."
+    )
+    # Small site-specific steer
+    site_nudge = {
+        "vailvacay.com": "Prefer outdoor/seasonal angles (e.g., scenic drives, hikes, village scenes, gear/packing, kid-friendly, food).",
+        "bostonvacay.com": "Prefer city/harbor/food/transport angles (ferries, terminals, seafood, neighborhoods, historic sites).",
+        "bangkokvacay.com": "Prefer transit/markets/temples/food angles; keep it family-friendly and non-explicit.",
+        "ipetzo.com": "Prefer pet-friendly locations, indoor/outdoor play, grooming, gear.",
+        "1-800deals.com": "Prefer generic shopping, unboxing, price-checking scenes (no brand names).",
+    }.get(site_key, "")
+    user = f"Main keyword: {main_keyword}\nSite: {site_key}\nCount: {count}\nGuidance: {site_nudge}"
+    try:
+        resp = chat_completion(api_key, [
+            {"role":"system","content":system},
+            {"role":"user","content":user}
+        ], temperature=0.5, model="gpt-4o-mini")
+        data = extract_json(resp)
+        if not data or "variants" not in data or not isinstance(data["variants"], list):
+            return []
+        # Clean & dedupe
+        out: List[str] = []
+        seen = set([main_keyword.strip().lower()])
+        for v in data["variants"]:
+            if not isinstance(v, str):
+                continue
+            s = v.strip()
+            if not s:
+                continue
+            if s.lower() in seen:
+                continue
+            seen.add(s.lower())
+            out.append(s[:140])  # keep concise
+            if len(out) >= count:
+                break
+        return out
+    except Exception:
+        return []
+
+# =========================
 # UI
 # =========================
 st.title(f"{APP_NAME} — {APP_VERSION}")
-st.caption("Choose an output preset (Blog or Pinterest). Pinterest uses a 2:3 vertical crop and portrait-oriented prompts. "
-           "Season Engine fixes month visuals; Corridor Engine fixes 'between/from A to B' queries. "
-           "Optional SerpAPI adds reference cues and price hints. Output: WebP + ZIP + per-image downloads.")
+st.caption("Paste keywords (one per line). Set 'Images per keyword' to generate LSI-based variants automatically. "
+           "Pinterest preset enforces a 2:3 vertical crop. Season + Corridor Engines fix visuals. "
+           "Optional SerpAPI adds reference cues and price hints (never rendered as text).")
 
 if APP_PASSWORD:
     gate = st.text_input("Team password", type="password")
@@ -452,6 +510,8 @@ with st.sidebar:
                         index=list(SITE_PRESETS.keys()).index(DEFAULT_SITE))
     output_preset = st.selectbox("Output preset", list(OUTPUT_PRESETS.keys()),
                                  index=list(OUTPUT_PRESETS.keys()).index(DEFAULT_OUTPUT_PRESET))
+    images_per_kw = st.number_input("Images per keyword", min_value=1, max_value=12, value=1, step=1,
+                                    help="If >1, we generate N-1 LSI variants per keyword.")
     quality = st.slider("WebP quality", 60, 95, DEFAULT_QUALITY)
     render_size = st.selectbox(
         "Model render size (internal)",
@@ -472,7 +532,7 @@ openai_key = st.text_input(
 keywords_text = st.text_area(
     "Keywords (one per line)",
     height=280,
-    placeholder="things to do in Vail in April\nbest seafood restaurant in Boston\nwhat county is Vail\nthings to see between Vail and Albuquerque",
+    placeholder="Things to do in Vail in October\nbest seafood restaurant in Boston\nthings to see between Vail and Albuquerque",
 )
 
 c1, c2 = st.columns(2)
@@ -482,7 +542,7 @@ if c2.button("Clear"):
     st.experimental_rerun()
 
 # =========================
-# Run
+# Core helpers
 # =========================
 def choose_render_size_for_orientation(chosen_size: str, orientation_note: str) -> str:
     portrait = "portrait" in orientation_note
@@ -540,20 +600,39 @@ def do_one(api_key: str, keyword: str, site_key: str,
     img = Image.open(io.BytesIO(png))
     return final_prompt, to_webp_bytes(img, W, H, quality), facts_hint, ref_titles, ref_cues
 
+# =========================
+# Run
+# =========================
 if run:
     if not openai_key:
         st.warning("Please enter your OpenAI API key.")
         st.stop()
 
-    kws: List[str] = [ln.strip() for ln in keywords_text.splitlines() if ln.strip()]
-    if not kws:
+    base_kws: List[str] = [ln.strip() for ln in keywords_text.splitlines() if ln.strip()]
+    if not base_kws:
         st.warning("Please paste at least one keyword.")
         st.stop()
 
     out_cfg = OUTPUT_PRESETS[output_preset]
 
+    # Build the worklist: for each main keyword, generate LSI variants (N-1)
+    work_items: List[Tuple[str, str]] = []  # (main_keyword, actual_keyword_to_render)
+    lsi_record: Dict[str, List[str]] = {}   # main -> [lsi variants]
+    for main_kw in base_kws:
+        # LSI generation
+        need = max(0, images_per_kw - 1)
+        lsi = generate_lsi_variants(openai_key, main_kw, site, need) if need > 0 else []
+        lsi_record[main_kw] = lsi
+        # queue: main + its lsi
+        work_items.append((main_kw, main_kw))
+        for v in lsi:
+            work_items.append((main_kw, v))
+
+    total = len(work_items)
     prog = st.progress(0)
     status = st.empty()
+    done = 0
+
     thumbs: List[Tuple[str, bytes]] = []
     prompts_used: List[Tuple[str, str]] = []
     facts_notes: List[Tuple[str, str]] = []
@@ -562,12 +641,17 @@ if run:
     zip_buf = io.BytesIO()
     zipf = zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED)
 
-    for i, kw in enumerate(kws, start=1):
-        fname = f"{slugify(kw)}.webp"
+    for main_kw, actual_kw in work_items:
+        # File naming: include both main + variant for clarity (unless same)
+        if actual_kw.strip().lower() == main_kw.strip().lower():
+            fname = f"{slugify(main_kw)}.webp"
+        else:
+            fname = f"{slugify(main_kw)}--{slugify(actual_kw)}.webp"
+
         try:
-            status.text(f"Generating {i}/{len(kws)}: {kw}")
+            status.text(f"Generating {done+1}/{total}: {actual_kw}")
             prompt_used, webp, facts_hint, ref_titles, ref_cues = do_one(
-                openai_key, kw, site, out_cfg, render_size, quality, serpapi_key
+                openai_key, actual_kw, site, out_cfg, render_size, quality, serpapi_key
             )
             zipf.writestr(fname, webp)
             thumbs.append((fname, webp))
@@ -577,8 +661,10 @@ if run:
             if ref_titles or ref_cues:
                 ref_notes.append((fname, ref_titles, ref_cues))
         except Exception as e:
-            st.error(f"{kw}: {e}")
-        prog.progress(i/len(kws))
+            st.error(f"{actual_kw}: {e}")
+        finally:
+            done += 1
+            prog.progress(done/total)
 
     zipf.close()
     zip_buf.seek(0)
@@ -603,6 +689,15 @@ if run:
             for fname, p in prompts_used:
                 st.markdown(f"**{fname}**")
                 st.code(p, language="text")
+
+        if lsi_record:
+            with st.expander("LSI variants generated"):
+                for main_kw, variants in lsi_record.items():
+                    st.markdown(f"**{main_kw}**")
+                    if variants:
+                        st.write(", ".join(variants))
+                    else:
+                        st.write("_No variants (images per keyword was 1 or LSI generation returned none)._")
 
         if facts_notes:
             with st.expander("Price facts assist (reference only)"):
