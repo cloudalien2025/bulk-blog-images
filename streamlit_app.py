@@ -1,15 +1,14 @@
-# ImageForge v0.8 "Explorer"
-# Adds SerpAPI thumbnail source + LSI expansion (Off / Heuristic / OpenAI)
-# Keeps Reference-Lock, Fidelity/retry, Venue mode, Pinterest, and CC-first logic.
+# ImageForge v0.8.1 — Explorer (Hotfix)
+# SerpAPI + LSI + Reference-Lock; fixes OpenAI 400 (response_format) and NameError on fallback.
 
-import os, io, re, time, base64, zipfile, json, random, math
+import os, io, re, time, base64, zipfile, json, random
 from typing import List, Dict, Optional, Tuple
 
 import requests
 from PIL import Image, ImageStat
 import streamlit as st
 
-APP_TITLE = "ImageForge v0.8 — Explorer (SerpAPI + LSI)"
+APP_TITLE = "ImageForge v0.8.1 — Explorer (Hotfix)"
 
 # ---------- OUTPUT SIZES ----------
 DEFAULT_OUTPUT_W, DEFAULT_OUTPUT_H = 1200, 675
@@ -50,7 +49,7 @@ def save_webp_bytes(img: Image.Image, w: int, h: int, q: int) -> bytes:
     buf = io.BytesIO(); img.save(buf, "WEBP", quality=q, method=6)
     return buf.getvalue()
 
-def fetch_image_bytes(url: str, timeout: int = 20) -> Optional[bytes]:
+def fetch_image_bytes(url: str, timeout: int = 25) -> Optional[bytes]:
     try:
         r = requests.get(url, timeout=timeout, headers={"User-Agent":"Mozilla/5.0"})
         if r.status_code == 200 and r.content:
@@ -207,7 +206,6 @@ def build_prompt(site: str, keyword: str, season_mode: str,
     elif season_mode in ("Winter","Summer","Fall","Spring"):
         season_hint = f"Season cues: {season_mode}. "
 
-    # constraints
     constraints = []
     if ref_feat and ref_feat.get("ok"):
         cl = set(ref_feat.get("checklist", []))
@@ -221,12 +219,11 @@ def build_prompt(site: str, keyword: str, season_mode: str,
                     "patio_umbrellas_or_warm_yellow_accents","visible_sky_background"]:
             if key in cl: constraints.append(names[key])
 
-    must = ("must clearly include" if fidelity >= 60 else "should include")
     lock_phrase = ""
     if lock_strength == "Strong" and constraints:
-        lock_phrase = f" The scene {must}: " + ", ".join(constraints) + "."
+        lock_phrase = " The scene must clearly include: " + ", ".join(constraints) + "."
     elif lock_strength == "Moderate" and constraints:
-        lock_phrase = f" The scene should feature: " + ", ".join(constraints) + "."
+        lock_phrase = " The scene should include: " + ", ".join(constraints) + "."
 
     venue_bits = ""
     if venue:
@@ -249,18 +246,27 @@ def build_prompt(site: str, keyword: str, season_mode: str,
             f"{venue_bits}{lock_phrase}{strict}")
 
 # ---------- OPENAI ----------
-def dalle_generate_png_bytes(prompt: str, size: str, api_key: str) -> bytes:
+def dalle_generate_image_bytes(prompt: str, size: str, api_key: str) -> bytes:
+    """
+    Robust: no 'response_format' sent. If API returns b64_json we decode, else we fetch from 'url'.
+    """
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    payload = {"model":"gpt-image-1", "prompt": prompt, "size": size, "response_format":"b64_json"}
+    payload = {"model":"gpt-image-1", "prompt": prompt, "size": size}
     r = requests.post("https://api.openai.com/v1/images/generations",
                       headers=headers, json=payload, timeout=120)
     if r.status_code != 200:
         raise RuntimeError(f"OpenAI error {r.status_code}: {r.text}")
-    b64 = r.json()["data"][0]["b64_json"]
-    return base64.b64decode(b64)
+    data = r.json().get("data", [{}])[0]
+    if "b64_json" in data:
+        return base64.b64decode(data["b64_json"])
+    if "url" in data:
+        bytes_ = fetch_image_bytes(data["url"])
+        if not bytes_:
+            raise RuntimeError("Failed to download image from returned URL.")
+        return bytes_
+    raise RuntimeError("OpenAI response missing image data.")
 
 def openai_lsi_terms(keyword: str, k: int, api_key: str) -> List[str]:
-    """Use OpenAI text to produce LSI-style subtopics. Returns at most k unique lines."""
     try:
         url = "https://api.openai.com/v1/chat/completions"
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type":"application/json"}
@@ -284,14 +290,12 @@ def openai_lsi_terms(keyword: str, k: int, api_key: str) -> List[str]:
         return []
 
 def heuristic_lsi(keyword: str, k: int) -> List[str]:
-    """Zero-cost LSI heuristic: mixes generic buckets with detected city/season terms."""
     k = max(0,k)
     out = []
     klow = keyword.lower()
     loc = ""
     m = re.search(r"in ([a-z ,\-]+)$", klow) or re.search(r"in ([a-z ,\-]+)\b", klow)
     if m: loc = m.group(1).strip(", ").title()
-
     buckets = ["best photo spots", "scenic viewpoint", "cozy cafés", "family-friendly activity",
                "hidden gem", "budget-friendly idea", "romantic spot", "day trip", "local market",
                "popular hike", "waterfront walk", "museum/gallery", "night view", "sunrise/sunset spot"]
@@ -349,10 +353,8 @@ if colB.button("Clear"): st.session_state.clear(); st.experimental_rerun()
 # ---------- THUMBNAIL FLOW ----------
 def collect_thumbnails(q: str, n: int) -> List[Dict]:
     items: List[Dict] = []
-    # order: CC first if checked
     if prefer_cc and use_openverse:
         items.extend(openverse_search(q, n))
-    # add non-CC if allowed and still short
     if allow_noncc:
         still = n - len(items)
         if still > 0 and use_cse:
@@ -391,7 +393,6 @@ if generate_btn:
     if not keywords:
         st.warning("Please paste at least one keyword."); st.stop()
 
-    # LSI expansion plan
     def expand_keywords(main_kw: str) -> List[str]:
         if images_per_kw <= 1 or lsi_mode == "Off":
             return [main_kw]
@@ -401,10 +402,8 @@ if generate_btn:
             extras = openai_lsi_terms(main_kw, needed, openai_key)
         if not extras and lsi_mode in ("Heuristic","OpenAI"):
             extras = heuristic_lsi(main_kw, needed)
-        # Always include main first
         return [main_kw] + extras[:needed]
 
-    # Prepare archive
     zip_buf = io.BytesIO()
     zf = zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED)
     gallery = []
@@ -418,7 +417,6 @@ if generate_btn:
 
         for j, active_kw in enumerate(all_subkws, start=1):
             venue = venue_mode_hint(active_kw)
-            # Thumbs
             items = collect_thumbnails(active_kw, cand_per_kw)
             with st.expander(f"📷 Thumbnails — choose one or leave 'AI render': {active_kw}", expanded=False):
                 picked = show_thumb_picker(active_kw, items)
@@ -433,27 +431,36 @@ if generate_btn:
                     ref_feat = feat; expect = expectation_from_features(feat)
 
             lock = lock_strength if ref_feat else "Off"
-            prompt = build_prompt(SITE_PROFILES.get(site, SITE_PROFILES[DEFAULT_SITE]) and site,
-                                  active_kw, season_mode, ref_feat, fidelity, lock, venue)
+            prompt = build_prompt(site, active_kw, season_mode, ref_feat, fidelity, lock, venue)
 
             tries_per_img = 1 + (fidelity // 40)
-            ok_img = None; local_prompt = prompt
-            for t in range(tries_per_img):
+            ok_img: Optional[bytes] = None
+            last_bytes: Optional[bytes] = None
+            local_prompt = prompt
+
+            for _t in range(tries_per_img):
+                img_bytes = None
                 try:
-                    png = dalle_generate_png_bytes(local_prompt, render_size, openai_key)
+                    img_bytes = dalle_generate_image_bytes(local_prompt, render_size, openai_key)
                 except Exception as e:
                     st.error(f"{active_kw}: OpenAI error — {e}")
                     break
+                last_bytes = img_bytes
                 if ref_feat and lock != "Off":
-                    if postcheck(png, expect):
-                        ok_img = png; break
+                    if postcheck(img_bytes, expect):
+                        ok_img = img_bytes; break
                     else:
                         local_prompt += " The required elements must be clearly visible."
                 else:
-                    ok_img = png; break
-            if not ok_img: ok_img = png
+                    ok_img = img_bytes; break
 
-            # save blog
+            if ok_img is None:
+                if last_bytes is None:
+                    # nothing produced; skip this subkeyword
+                    continue
+                ok_img = last_bytes
+
+            # save blog size
             try:
                 im = Image.open(io.BytesIO(ok_img)).convert("RGB")
             except Exception:
@@ -467,7 +474,6 @@ if generate_btn:
             zf.writestr(fname_blog, webp_bytes)
             gallery.append((fname_blog, webp_bytes))
 
-            # pinterest
             if make_pins:
                 fname_pin = f"{base_slug}{suffix}-pin.webp"
                 pin_bytes = save_webp_bytes(im, PIN_OUTPUT_W, PIN_OUTPUT_H, webp_quality)
