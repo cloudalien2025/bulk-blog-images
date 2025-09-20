@@ -1,11 +1,12 @@
-# ImageForge v1.2 — Real-First + References + LSI (manual pick = 2-step, one choice per keyword)
-# - Step 1: Generate -> show candidates (Places/Street View/Openverse/SerpAPI refs)
-# - Step 2: Pick one per keyword (single select) -> Build images from my selections
-# - Strict image-byte validation to avoid crashes
-# - 1200x675 WebP (+ optional 1000x1500 Pinterest), metadata.csv
-# - LSI expansion (heuristic), optional OpenAI fallback
+# ImageForge v1.3 — Real-First + References + LSI (manual pick = 2-step, one choice per keyword)
+# - Fix: replace deprecated st.experimental_rerun() with st.rerun()
+# - Secrets-aware: auto-populate key inputs from st.secrets or environment (masked)
+# - Two-step flow: Generate -> choose one per keyword -> Build images
+# - Real photos first (Google Places, Street View, Openverse); SerpAPI used as reference-only
+# - Optional OpenAI fallback (photoreal, no text/logos)
+# - Exports 1200×675 WebP (+ optional 1000×1500 Pinterest) + metadata.csv
 
-import io, re, zipfile, base64
+import io, re, zipfile, base64, os
 from typing import List, Optional
 from dataclasses import dataclass
 
@@ -14,9 +15,9 @@ from PIL import Image
 import streamlit as st
 import pandas as pd
 
-st.set_page_config(page_title="ImageForge v1.2 — Real-First + References + LSI", layout="wide")
+st.set_page_config(page_title="ImageForge v1.3 — Real-First + References + LSI", layout="wide")
 
-APP_TITLE = "ImageForge v1.2 — Real-First + References + LSI"
+APP_TITLE = "ImageForge v1.3 — Real-First + References + LSI"
 TARGET_W, TARGET_H = 1200, 675
 PINTEREST_W, PINTEREST_H = 1000, 1500
 DEFAULT_QUALITY = 82
@@ -247,7 +248,6 @@ def openai_generate_image_bytes(prompt: str, size: str, api_key: str) -> Optiona
         url = "https://api.openai.com/v1/images/generations"
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
-        # Try URL first
         payload = {"model": "gpt-image-1", "prompt": prompt, "size": size}
         r = requests.post(url, headers=headers, json=payload, timeout=60)
         if r.status_code == 200:
@@ -261,7 +261,6 @@ def openai_generate_image_bytes(prompt: str, size: str, api_key: str) -> Optiona
                 if is_image_bytes(data):
                     return data
 
-        # Fallback to explicit b64
         payload = {"model":"gpt-image-1","prompt":prompt,"size":size,"response_format":"b64_json"}
         r = requests.post(url, headers=headers, json=payload, timeout=60)
         if r.status_code == 200:
@@ -308,11 +307,19 @@ def lsi_expand(keyword: str, count: int) -> List[str]:
 st.title(APP_TITLE)
 st.caption("Two-step manual pick: Generate → choose one per keyword → Build images. Real photos first, AI only if needed.")
 
+# auto-prefill keys from secrets / env (masked inputs)
+prefill_openai = st.secrets.get("OPENAI_API_KEY", os.environ.get("OPENAI_API_KEY", ""))
+prefill_google = st.secrets.get("GOOGLE_MAPS_KEY", os.environ.get("GOOGLE_MAPS_KEY", ""))
+prefill_serp  = st.secrets.get("SERPAPI_KEY",     os.environ.get("SERPAPI_KEY", ""))
+
 with st.sidebar:
     st.header("Keys")
-    google_key = st.text_input("Google Maps/Places API key (required for real photos)", type="password")
-    openai_key = st.text_input("OpenAI API key (optional, AI fallback)", type="password")
-    serpapi_key = st.text_input("SerpAPI key (optional, reference thumbnails)", type="password")
+    google_key = st.text_input("Google Maps/Places API key (required for real photos)",
+                               type="password", value=prefill_google)
+    openai_key = st.text_input("OpenAI API key (optional, AI fallback)",
+                               type="password", value=prefill_openai)
+    serpapi_key = st.text_input("SerpAPI key (optional, reference thumbnails)",
+                                type="password", value=prefill_serp)
 
     st.header("Output")
     site = st.selectbox("Site style (AI fallback only)", list(SITE_PROFILES.keys()),
@@ -344,7 +351,7 @@ generate_btn = colA.button("Generate")
 clear_btn = colB.button("Clear")
 if clear_btn:
     st.session_state.clear()
-    st.experimental_rerun()
+    st.rerun()  # <-- fixed
 
 # ---------------- Collect ----------------
 
@@ -442,7 +449,7 @@ if generate_btn:
         expanded.extend(lsi_expand(kw, imgs_per_kw))
     st.session_state.keywords = expanded
     st.session_state.phase = "picking"
-    st.experimental_rerun()
+    st.rerun()  # <-- fixed
 
 if st.session_state.phase == "picking":
     st.info("Step 1/2 — Pick one thumbnail per keyword (or leave 'Auto-best'), then click **Build images from my selections**.")
@@ -470,7 +477,7 @@ if st.session_state.phase == "picking":
 
     if build_btn:
         st.session_state.phase = "building"
-        st.experimental_rerun()
+        st.rerun()  # <-- fixed
 
 if st.session_state.phase == "building":
     all_rows = []
@@ -538,13 +545,13 @@ if st.session_state.phase == "building":
                                    file_name=r["filename"], mime="image/webp")
             shown += 1
 
-    # reset to idle so the next run starts fresh
     st.session_state.phase = "idle"
 
 st.markdown("""
 **Notes**
-- Manual pick is now a 2-step flow to ensure your selection is honored.
-- SerpAPI thumbnails are reference-only (never exported).
+- Manual pick is a 2-step flow to guarantee your selection is honored.
+- Add keys in **secrets** or env vars once; inputs auto-populate (masked) next time.
+- SerpAPI results are reference-only; they won’t be exported.
 - Openverse (CC) entries include license/credit in metadata.csv.
 - All images are byte-validated before display/export to avoid crashes.
 """)
