@@ -1,4 +1,4 @@
-# ImageForge v0.9.5 — Bulk blog/Pinterest image generator with optional CC photo picker
+# ImageForge v0.9.6 — Bulk blog/Pinterest image generator with optional CC photo picker
 # Requirements: streamlit, requests, pillow
 # APIs: OpenAI (required), SerpAPI (optional). Openverse needs no key.
 
@@ -14,7 +14,7 @@ import streamlit as st
 # App config
 # ---------------------------
 APP_NAME = "ImageForge"
-APP_VERSION = "v0.9.5"
+APP_VERSION = "v0.9.6"
 DEFAULT_QUALITY = 82
 BLOG_W, BLOG_H = 1200, 675           # 16:9
 PIN_W, PIN_H  = 1000, 1500           # 2:3 (Pinterest standard pin)
@@ -164,44 +164,51 @@ def build_prompt(site: str, keyword: str, season: str, orientation: str) -> str:
 
 
 # ---------------------------
-# OpenAI images with compatibility fallback
+# OpenAI images with compatibility fallback (patched)
 # ---------------------------
+def _decode_openai_image_payload(data0: dict) -> bytes:
+    """Accept either URL or b64_json in any response."""
+    if "b64_json" in data0 and data0["b64_json"]:
+        return base64.b64decode(data0["b64_json"])
+    if "url" in data0 and data0["url"]:
+        img = safe_download_image(data0["url"])
+        if not img:
+            raise RuntimeError("Failed to download image from OpenAI URL.")
+        buf = io.BytesIO(); img.save(buf, "PNG"); return buf.getvalue()
+    raise KeyError("No 'url' or 'b64_json' in OpenAI response.")
+
 def openai_image_bytes(prompt: str, size: str, api_key: str) -> bytes:
     """
-    Try gpt-image-1 with b64_json; if API returns 'unknown parameter: response_format',
-    retry without response_format and download by URL.
+    Try gpt-image-1 with b64_json; if API rejects the param or returns a different shape,
+    retry without response_format. In all cases, accept either 'b64_json' or 'url'.
     """
     url = "https://api.openai.com/v1/images/generations"
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
     # Attempt 1: request base64
-    payload = {"model": "gpt-image-1", "prompt": prompt, "size": size, "response_format": "b64_json"}
-    r = requests.post(url, headers=headers, json=payload, timeout=120)
-    if r.status_code == 200:
-        b64 = r.json()["data"][0]["b64_json"]
-        return base64.b64decode(b64)
+    payload1 = {"model": "gpt-image-1", "prompt": prompt, "size": size, "response_format": "b64_json"}
+    r1 = requests.post(url, headers=headers, json=payload1, timeout=120)
+    if r1.status_code == 200:
+        data0 = r1.json()["data"][0]
+        return _decode_openai_image_payload(data0)
 
-    # If response_format not supported, try URL flow
+    # Attempt 2: URL (or b64) without response_format
+    payload2 = {"model": "gpt-image-1", "prompt": prompt, "size": size}
+    r2 = requests.post(url, headers=headers, json=payload2, timeout=120)
+    if r2.status_code == 200:
+        data0 = r2.json()["data"][0]
+        return _decode_openai_image_payload(data0)
+
+    # Otherwise, bubble up the clearer of the two errors
     try:
-        err = r.json()
-        msg = err.get("error", {}).get("message", "").lower()
+        msg1 = r1.json()
     except Exception:
-        msg = ""
-    if "response_format" in msg or r.status_code == 400:
-        payload2 = {"model": "gpt-image-1", "prompt": prompt, "size": size}
-        r2 = requests.post(url, headers=headers, json=payload2, timeout=120)
-        if r2.status_code != 200:
-            raise RuntimeError(f"OpenAI error {r2.status_code}: {r2.text}")
-        img_url = r2.json()["data"][0]["url"]
-        img = safe_download_image(img_url)
-        if not img:
-            raise RuntimeError("Failed to download image from OpenAI URL.")
-        buf = io.BytesIO()
-        img.save(buf, "PNG")
-        return buf.getvalue()
-
-    # Otherwise, bubble up original error
-    raise RuntimeError(f"OpenAI error {r.status_code}: {r.text}")
+        msg1 = r1.text
+    try:
+        msg2 = r2.json()
+    except Exception:
+        msg2 = r2.text
+    raise RuntimeError(f"OpenAI error. First: {r1.status_code} {msg1} | Second: {r2.status_code} {msg2}")
 
 
 # ---------------------------
@@ -245,7 +252,7 @@ def openai_lsi(keyword: str, k: int, api_key: str) -> List[str]:
 
 
 # ---------------------------
-# Reference image search (SerpAPI + Openverse) — patched
+# Reference image search (SerpAPI + Openverse) — resilient
 # ---------------------------
 def serpapi_google_images(query: str, serp_key: str, num: int = 6, cc_only: bool = False) -> List[Dict]:
     if not serp_key:
@@ -260,7 +267,6 @@ def serpapi_google_images(query: str, serp_key: str, num: int = 6, cc_only: bool
         for it in r.json().get("images_results", [])[:num]:
             results.append({
                 "thumb_url": it.get("thumbnail"),
-                # fallbacks
                 "original_url": it.get("original") or it.get("link") or it.get("thumbnail"),
                 "title": it.get("title") or "",
                 "host": it.get("source") or it.get("domain") or "",
@@ -487,7 +493,6 @@ if run_btn:
         if webp_bytes:
             previews.append((f"{slugify(actual_kw)}.webp", webp_bytes))
 
-        st.session_state["site"] = DEFAULT_SITE
         prog.progress((idx+1)/total)
 
     if previews:
