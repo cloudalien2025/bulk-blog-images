@@ -1,19 +1,19 @@
-# ImageForge v0.9.4 (CC-SmartFallback)
-# CC-first thumbnails with safe non-CC "reference only" fallback + AI rendering.
+# ImageForge v0.9.5 (Inspiration Mode)
+# CC-first, safe non-CC "reference only" thumbnails, and an Inspiration mode
+# that guides an original AI render from a non-CC reference without copying it.
 # Requirements: streamlit, requests, pillow
 
-import os, io, re, json, time, math, base64, zipfile, datetime
+import os, io, re, json, time, base64, zipfile
 from typing import List, Dict, Optional, Tuple
 import requests
 from PIL import Image
 import streamlit as st
 
-# ---------------------------- Config ---------------------------- #
+APP_TITLE = "ImageForge – CC + Inspiration"
 
-APP_TITLE = "ImageForge – CC-SmartFallback"
 DEFAULT_OUTPUT_W, DEFAULT_OUTPUT_H = 1200, 675
 DEFAULT_WEBP_QUALITY = 82
-OPENAI_IMG_SIZES = ["1536x1024", "1024x1536", "1024x1024"]  # cropped to target later
+OPENAI_IMG_SIZES = ["1536x1024", "1024x1536", "1024x1024"]  # we'll crop to target
 
 SITE_PROFILES = {
     "vailvacay.com":  "Photorealistic alpine resort & village scenes in the Colorado Rockies; gondolas, riverwalks, cozy lodges; no text.",
@@ -23,7 +23,7 @@ SITE_PROFILES = {
     "1-800deals.com":  "Photorealistic retail/ecommerce visuals; shopping scenes, parcels; generic products; clean backgrounds; no brands or text.",
 }
 
-# ------------------------- Utilities ---------------------------- #
+# ------------------------- Helpers ------------------------- #
 
 def slugify(text: str) -> str:
     t = text.lower().strip()
@@ -36,12 +36,10 @@ def crop_to_aspect(img: Image.Image, target_w: int, target_h: int) -> Image.Imag
     w, h = img.size
     cur_ratio = w / h
     if cur_ratio > target_ratio:
-        new_w = int(h * target_ratio)
-        left = (w - new_w) // 2
+        new_w = int(h * target_ratio); left = (w - new_w) // 2
         box = (left, 0, left + new_w, h)
     else:
-        new_h = int(w / target_ratio)
-        top = (h - new_h) // 2
+        new_h = int(w / target_ratio); top = (h - new_h) // 2
         box = (0, top, w, top + new_h)
     return img.crop(box)
 
@@ -54,24 +52,21 @@ def to_webp_bytes(img: Image.Image, w: int, h: int, quality: int) -> bytes:
 
 def season_hint(keyword: str, site: str) -> str:
     k = keyword.lower()
-    # Minimal hints; you can expand later
-    if "winter" in k or "december" in k or "january" in k or "february" in k:
-        return "winter conditions, snow present"
-    if "summer" in k or "july" in k or "august" in k or "june" in k:
+    if any(x in k for x in ["winter","december","january","february","christmas","ski"]):
+        return "winter conditions, snow present on ski runs and rooftops"
+    if any(x in k for x in ["summer","june","july","august"]):
         return "summer conditions, lush green"
-    if "fall" in k or "autumn" in k or "september" in k or "october" in k or "november" in k:
+    if any(x in k for x in ["fall","autumn","september","october","november"]):
         return "autumn foliage"
-    if "spring" in k or "april" in k or "may" in k or "march" in k:
-        # Vail nuance: spring may still have snow on mountain
-        if "vail" in site or "vail" in k:
+    if any(x in k for x in ["spring","march","april","may"]):
+        if "vail" in k or "vail" in site:
             return "late winter/early spring in the mountains; snow remains on ski runs"
         return "springtime"
     return "seasonally appropriate conditions"
 
-def build_prompt(site: str, keyword: str, season_on: bool) -> str:
+def build_prompt(site: str, keyword: str, season_on: bool, inspiration: Optional[Dict] = None) -> str:
     base = SITE_PROFILES.get(site, SITE_PROFILES["vailvacay.com"])
     style_hints = []
-
     k = keyword.lower()
 
     if any(x in k for x in ["how far","directions","from","between"]):
@@ -86,40 +81,34 @@ def build_prompt(site: str, keyword: str, season_on: bool) -> str:
         style_hints.append("family-friendly vibe, gentle activities")
     if any(x in k for x in ["county","river","mountain range","history","when did","when was"]):
         style_hints.append("editorial/documentary feel emphasizing place over people")
+    if "ski patrol" in k:
+        style_hints.append("winter slopes visible; snow present (avoid green summer grass)")
 
     season = season_hint(keyword, site) if season_on else "seasonally appropriate"
-    if "ski patrol" in k and "snow" not in k:
-        style_hints.append("active ski patrol with snow present on slopes (avoid green summer grass)")
-
     style = ", ".join([s for s in style_hints if s]) or "scene appropriate to the topic"
 
-    return (f"{base} Balanced composition; natural light; editorial stock-photo feel. "
-            f"Create an image for the topic: '{keyword}'. Landscape orientation. No words or typography. "
-            f"Ensure {season}. Scene intent: {style}.")
+    prompt = (f"{base} Balanced composition; natural light; editorial stock-photo feel. "
+              f"Create an image for the topic: '{keyword}'. Landscape orientation. No words or typography. "
+              f"Ensure {season}. Scene intent: {style}.")
 
-# ---------------------- OpenAI Image Gen ------------------------ #
+    # Inspiration mode: guide an original composition without copying
+    if inspiration:
+        title = inspiration.get("title","reference image")
+        notes = inspiration.get("notes","")
+        prompt += (" Create a completely original scene inspired by the following cues from a reference photo "
+                   f"(do not copy the exact building or layout; avoid any logos, signage, or readable text): "
+                   f"Title: {title}. Key visual elements: {notes}.")
+    return prompt
 
 def openai_generate_image(prompt: str, size: str, api_key: str) -> Image.Image:
-    """
-    Robust against API variations:
-    - Tries images/generations with default response (URL).
-    - If b64_json present, decodes it.
-    """
     url = "https://api.openai.com/v1/images/generations"
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    payload = {
-        "model": "gpt-image-1",
-        "prompt": prompt,
-        "size": size
-        # Do NOT send response_format to avoid 400 "unknown parameter"
-    }
+    payload = {"model": "gpt-image-1", "prompt": prompt, "size": size}
     r = requests.post(url, headers=headers, json=payload, timeout=180)
     if r.status_code != 200:
         raise RuntimeError(f"OpenAI error {r.status_code}: {r.text}")
-
     data0 = r.json().get("data", [{}])[0]
     img_bytes = None
-
     if "b64_json" in data0:
         img_bytes = base64.b64decode(data0["b64_json"])
     elif "url" in data0 and data0["url"]:
@@ -128,59 +117,36 @@ def openai_generate_image(prompt: str, size: str, api_key: str) -> Image.Image:
         img_bytes = getr.content
     else:
         raise RuntimeError("OpenAI returned no image data.")
-
     return Image.open(io.BytesIO(img_bytes))
 
-# ---------------------- CC Search (Openverse) ------------------- #
+# -------------------- CC & Reference Search -------------------- #
 
 def openverse_search(query: str, num: int = 4) -> List[Dict]:
-    """
-    Commercial-friendly CC images via Openverse.
-    Returns list of dicts with keys: title, thumb_url, full_url, source, license
-    """
     try:
-        params = {
-            "q": query,
-            "license_type": "commercial",  # only commercial-friendly licenses
-            "page": 1,
-            "page_size": max(1, min(num, 20))
-        }
+        params = {"q": query, "license_type": "commercial", "page": 1, "page_size": max(1, min(num, 20))}
         r = requests.get("https://api.openverse.engineering/v1/images/", params=params, timeout=30)
         if r.status_code != 200:
             return []
-        results = []
-        for item in r.json().get("results", []):
-            full = item.get("url") or item.get("foreign_landing_url")
-            thumb = item.get("thumbnail") or full
-            if not full:
+        out = []
+        for it in r.json().get("results", []):
+            full = it.get("url") or it.get("foreign_landing_url")
+            thumb = it.get("thumbnail") or full
+            if not full: 
                 continue
-            results.append({
-                "title": item.get("title") or "Openverse image",
-                "thumb_url": thumb,
-                "full_url": full,
-                "source": "Openverse (CC)",
-                "license": item.get("license") or "cc",
-                "provider": item.get("provider")
-            })
-        return results
+            out.append({
+                "title": it.get("title") or "Openverse image",
+                "thumb_url": thumb, "full_url": full,
+                "source": "Openverse (CC)", "license": it.get("license") or "cc"}
+            )
+        return out
     except Exception:
         return []
 
-# ------------------ Reference Search (SerpAPI) ------------------ #
-
 def serpapi_google_images(query: str, serp_key: str, num: int = 4) -> List[Dict]:
-    """
-    Non-CC thumbnails strictly for reference/inspiration (NOT saved).
-    """
     if not serp_key:
         return []
     try:
-        params = {
-            "engine": "google_images",
-            "q": query,
-            "ijn": "0",
-            "api_key": serp_key
-        }
+        params = {"engine": "google_images", "q": query, "ijn": "0", "api_key": serp_key}
         r = requests.get("https://serpapi.com/search", params=params, timeout=40)
         if r.status_code != 200:
             return []
@@ -190,31 +156,25 @@ def serpapi_google_images(query: str, serp_key: str, num: int = 4) -> List[Dict]
             thumb = it.get("thumbnail") or it.get("original")
             full = it.get("original") or it.get("thumbnail")
             if not full:
-                # Defensive: skip items without fetchable url
                 continue
             out.append({
                 "title": it.get("title") or "Google image",
-                "thumb_url": thumb,
-                "full_url": full,
-                "source": "Google (non-CC)",
-                "license": "Reference only (non-CC)"
-            })
+                "thumb_url": thumb, "full_url": full,
+                "source": "Google (non-CC)", "license": "Reference only (non-CC)"}
+            )
         return out
     except Exception:
         return []
 
-# ----------------- Candidate Aggregation & Save ----------------- #
-
 def build_cc_query(keyword: str) -> str:
-    """Broaden venue queries a bit; never append site name."""
     q = keyword.strip()
-    if "vail" not in q.lower() and "bangkok" not in q.lower() and "boston" not in q.lower():
-        # nudge geolocation if the keyword lacks place context
-        q += " exterior storefront"
-    # For Vail venue names, make it clearer
-    if "vail" in q.lower() and not any(w in q.lower() for w in ["exterior","storefront","restaurant","hotel","lodge"]):
+    # Nudge venue queries to exterior/storefront; don't append site name ever
+    if "exterior" not in q.lower() and "storefront" not in q.lower():
         q += " exterior storefront"
     return q
+
+def is_noncc(c: Dict) -> bool:
+    return "non-cc" in c.get("source","").lower() or "reference" in c.get("license","").lower()
 
 def aggregate_candidates(keyword: str,
                          want_sources: List[str],
@@ -222,48 +182,37 @@ def aggregate_candidates(keyword: str,
                          num: int,
                          prefer_cc: bool,
                          allow_ref_noncc: bool) -> List[Dict]:
-    """
-    Returns candidate dicts with keys: title, thumb_url, full_url, source, license
-    """
     q = build_cc_query(keyword)
     results: List[Dict] = []
 
-    # Always try Openverse first when CC is preferred
     if prefer_cc and "Openverse" in want_sources:
-        results.extend(openverse_search(q, num=num))
+        results += openverse_search(q, num=num)
 
-    # If still empty and allowed, show reference-only non-CC via Google
     if not results and allow_ref_noncc and "Google (via SerpAPI)" in want_sources:
-        results.extend(serpapi_google_images(q, serp_key, num=num))
+        results += serpapi_google_images(q, serp_key, num=num)
 
-    # If CC isn't preferred at all, we can still show reference thumbnails (not saved)
     if not prefer_cc and "Google (via SerpAPI)" in want_sources and not results:
-        results.extend(serpapi_google_images(q, serp_key, num=num))
+        results += serpapi_google_images(q, serp_key, num=num)
 
-    # De-dupe by full_url
-    seen = set()
-    deduped = []
+    seen = set(); deduped = []
     for r in results:
         fu = r.get("full_url")
         if not fu or fu in seen:
             continue
-        seen.add(fu)
-        deduped.append(r)
-
+        seen.add(fu); deduped.append(r)
     return deduped
 
 def download_image(url: str) -> Optional[Image.Image]:
     try:
         r = requests.get(url, timeout=40)
-        if r.status_code != 200:
+        if r.status_code != 200: 
             return None
         return Image.open(io.BytesIO(r.content))
     except Exception:
         return None
 
-def save_cc_candidate(cand: Dict, fname_base: str, out_w: int, out_h: int, q: int) -> Optional[bytes]:
-    # Never save non-CC/reference items
-    if "non-cc" in cand.get("source","").lower() or "reference" in cand.get("license","").lower():
+def save_cc_candidate(cand: Dict, out_w: int, out_h: int, q: int) -> Optional[bytes]:
+    if is_noncc(cand):  # never save non-CC
         return None
     full = cand.get("full_url")
     if not full:
@@ -273,11 +222,26 @@ def save_cc_candidate(cand: Dict, fname_base: str, out_w: int, out_h: int, q: in
         return None
     return to_webp_bytes(img, out_w, out_h, q)
 
-# --------------------------- UI -------------------------------- #
+def guess_inspiration_notes(title: str, keyword: str) -> str:
+    tl = (title or "").lower()
+    kl = (keyword or "").lower()
+    notes = []
+    if any(x in tl+kl for x in ["snow","winter","ski","christmas"]):
+        notes.append("snow on ground and rooftops; winter ambiance")
+    if any(x in tl for x in ["patio","terrace","outdoor"]):
+        notes.append("cozy outdoor patio seating; umbrellas")
+    if any(x in tl+kl for x in ["vail","alpine","mountain"]):
+        notes.append("alpine village architecture; mountains in background")
+    if "string" in tl or "lights" in tl:
+        notes.append("warm string lights")
+    notes.append("no logos, no readable signage, original composition")
+    return "; ".join(notes)
+
+# ----------------------------- UI ----------------------------- #
 
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title(APP_TITLE)
-st.caption("CC-first with safe reference thumbnails. Then fallback to OpenAI render, cropped to 1200×675.")
+st.caption("Pick CC photos (saved) or use non-CC thumbnails as inspiration for an original AI render. No logos/text; no copying.")
 
 with st.sidebar:
     site = st.selectbox("Site style", list(SITE_PROFILES.keys()), index=0)
@@ -291,7 +255,7 @@ with st.sidebar:
 
     st.markdown("### API Keys")
     openai_key = st.text_input("OpenAI API key", type="password")
-    serp_key = st.text_input("SerpAPI key (for Google thumbnails)", type="password")
+    serp_key = st.text_input("SerpAPI key (Google thumbnails)", type="password")
 
     st.markdown("### Prefer Real Photos?")
     prefer_cc = st.checkbox("Try Creative-Commons photo first", value=True)
@@ -319,19 +283,16 @@ if do_gen:
     if not keywords:
         st.warning("Please paste at least one keyword.")
         st.stop()
-    if not openai_key:
-        st.info("OpenAI key not set — you can still pick a CC photo (if available). AI fallback needs the key.")
 
     zip_buf = io.BytesIO()
     zf = zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED)
-
     previews: List[Tuple[str, bytes]] = []
 
     for idx, kw in enumerate(keywords, start=1):
         st.info(f"Working {idx}/{len(keywords)}: {kw}")
-        exp = st.expander(f"📷  CC Thumbnails — choose one or leave 'AI render' · {kw}", expanded=True)
+        exp = st.expander(f"📷  CC Thumbnails — pick one or use 'Inspiration' · {kw}", expanded=True)
 
-        # 1) Gather candidates
+        # Gather candidates
         cands = aggregate_candidates(
             keyword=kw,
             want_sources=sources,
@@ -342,13 +303,13 @@ if do_gen:
         )
 
         chosen_bytes: Optional[bytes] = None
-        chosen_label: Optional[str] = None
+        inspiration_choice: Optional[Dict] = None
 
         with exp:
             picked_idx = None
+            noncc_options = [("None (no inspiration)", None)]
+
             if cands:
-                thumbs = []
-                options = []
                 for i, c in enumerate(cands):
                     thumb = c.get("thumb_url") or c.get("full_url")
                     if not thumb:
@@ -361,61 +322,81 @@ if do_gen:
                         st.write(f"License: {c.get('license','n/a')}")
                         st.write(f"Source: {c.get('source','')}")
                     st.markdown("---")
-                    thumbs.append(c)
-                    options.append(f"{i+1}. {c.get('title','Image')} ({c.get('source','')})")
 
-                if thumbs:
-                    picked = st.radio("Pick a CC thumbnail (non-CC items are for reference only and will not be saved). "
-                                      "Or leave unselected to use AI render.",
-                                      ["Use AI render"] + options, index=0)
-                    if picked != "Use AI render":
-                        try:
-                            picked_idx = int(picked.split(".")[0]) - 1
-                        except Exception:
-                            picked_idx = None
+                # Radio for CC pick
+                cc_labels = ["Use AI render"]
+                cc_map = {}
+                for i, c in enumerate(cands):
+                    if not is_noncc(c):  # CC only for saving
+                        label = f"{i+1}. {c.get('title','Image')} ({c.get('source','')})"
+                        cc_labels.append(label); cc_map[label] = i
+                chosen_label = st.radio(
+                    "Pick a Creative-Commons thumbnail to save (or leave 'Use AI render'). Non-CC items below can be used as inspiration only.",
+                    cc_labels, index=0
+                )
+                if chosen_label != "Use AI render":
+                    picked_idx = cc_map.get(chosen_label, None)
 
-                # If user picked a CC candidate, try to save it now
-                if picked_idx is not None and 0 <= picked_idx < len(thumbs):
-                    cand = thumbs[picked_idx]
-                    webp_bytes = save_cc_candidate(cand, slugify(kw), out_w, out_h, webp_q)
-                    if webp_bytes:
+                # Inspiration select (non-CC only)
+                for i, c in enumerate(cands):
+                    if is_noncc(c):
+                        noncc_options.append((f"{i+1}. {c.get('title','Image')} (ref only)", c))
+                opt_labels = [o[0] for o in noncc_options]
+                insp_sel = st.selectbox("Inspiration (optional, non-CC reference):", opt_labels, index=0)
+                sel_idx = opt_labels.index(insp_sel)
+                selected_ref = noncc_options[sel_idx][1]
+
+                insp_notes = ""
+                if selected_ref:
+                    default_notes = guess_inspiration_notes(selected_ref.get("title",""), kw)
+                    insp_notes = st.text_area("Inspiration notes (edit as needed)",
+                                              value=default_notes,
+                                              help="Describe visual elements to emulate. We’ll generate an original scene and avoid copying logos/signage.")
+
+                # If CC picked, try to save it now
+                if picked_idx is not None:
+                    cand = cands[picked_idx]
+                    webp = save_cc_candidate(cand, out_w, out_h, webp_q)
+                    if webp:
                         fname = f"{slugify(kw)}.webp"
-                        zf.writestr(fname, webp_bytes)
-                        previews.append((fname, webp_bytes))
-                        chosen_bytes = webp_bytes
-                        chosen_label = "CC photo"
+                        zf.writestr(fname, webp)
+                        previews.append((fname, webp))
+                        chosen_bytes = webp
                         st.success("Saved Creative-Commons image.")
                     else:
-                        st.warning("That candidate is non-CC or failed to download. Falling back to AI.")
+                        st.warning("That candidate is non-CC or failed to download; will use AI.")
 
-            # 2) If nothing chosen/saved, do AI render
+                # Prepare inspiration payload (used only if we do AI)
+                if selected_ref:
+                    inspiration_choice = {
+                        "title": selected_ref.get("title","reference image"),
+                        "notes": insp_notes or guess_inspiration_notes(selected_ref.get("title",""), kw)
+                    }
+
+            # If nothing chosen/saved, do AI render (optionally with inspiration)
             if chosen_bytes is None:
                 if not openai_key:
                     st.error("OpenAI key missing and no CC image saved. Skipping this keyword.")
                 else:
                     try:
-                        prompt = build_prompt(site, kw, season_on)
+                        prompt = build_prompt(site, kw, season_on, inspiration=inspiration_choice)
                         ai_img = openai_generate_image(prompt, size, openai_key)
-                        webp_bytes = to_webp_bytes(ai_img, out_w, out_h, webp_q)
+                        webp = to_webp_bytes(ai_img, out_w, out_h, webp_q)
                         fname = f"{slugify(kw)}.webp"
-                        zf.writestr(fname, webp_bytes)
-                        previews.append((fname, webp_bytes))
-                        chosen_bytes = webp_bytes
-                        chosen_label = "AI render"
+                        zf.writestr(fname, webp)
+                        previews.append((fname, webp))
                         st.success("AI render saved.")
                     except Exception as e:
                         st.error(f"OpenAI generation failed: {e}")
 
         st.markdown("---")
 
-    zf.close()
-    zip_buf.seek(0)
+    zf.close(); zip_buf.seek(0)
 
     if previews:
         st.success("Done! Download your images below.")
         st.download_button("⬇️ Download ZIP", data=zip_buf,
                            file_name=f"{slugify(site)}_images.zip", mime="application/zip")
-
         st.markdown("### Previews & individual downloads")
         cols = st.columns(3)
         for i, (fname, data_bytes) in enumerate(previews):
