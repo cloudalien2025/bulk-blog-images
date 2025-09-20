@@ -1,17 +1,13 @@
-# ImageForge Autopilot v3.0.0 — Real/Replica CC
-# One-click bulk blog/Pinterest images with:
-# - Hands-free Real/Replica (Creative Commons real photo first via SerpAPI → fallback to AI replica)
+# ImageForge Autopilot v3.1.0 — CC Preview
+# Bulk blog/Pinterest images with:
+# - Hands-free Real/Replica (Creative Commons real photo first via SerpAPI → fallback to AI)
+# - NEW: CC Thumbnail Preview & Manual Pick (two-step: Search & Preview → Render)
 # - LSI variants (N images per keyword)
-# - Season & Corridor Engines (fixes winter/summer and road-trip scenes)
+# - Season & Corridor Engines (winter/summer & road-trip realism)
 # - Pinterest/Blog output presets (WebP)
 #
-# Requirements: streamlit, requests, pillow
-# Secrets (optional): OPENAI_API_KEY, SERPAPI_API_KEY, APP_PASSWORD
-#
-# Notes:
-# - Real photos are retrieved only when Google Images via SerpAPI is filtered to Creative Commons (tbs=sur:fc).
-# - We save an ATTRIBUTION.txt in the ZIP whenever a CC image is used.
-# - AI replicas remain brand-neutral (no readable logos/text) to avoid rights issues and text artifacts.
+# pip install streamlit requests pillow
+# Streamlit secrets (optional): OPENAI_API_KEY, SERPAPI_API_KEY, APP_PASSWORD
 
 import io
 import re
@@ -24,11 +20,8 @@ import requests
 from PIL import Image
 import streamlit as st
 
-# ======================
-# App identity/config
-# ======================
 APP_NAME = "ImageForge Autopilot"
-APP_VERSION = "v3.0.0 — Real/Replica CC"
+APP_VERSION = "v3.1.0 — CC Preview"
 
 st.set_page_config(page_title=f"{APP_NAME} — {APP_VERSION}", layout="wide")
 
@@ -49,14 +42,10 @@ OUTPUT_PRESETS = {
 }
 DEFAULT_OUTPUT_PRESET = "Blog 1200×675 (16:9)"
 DEFAULT_QUALITY = 82
-
 API_IMAGE_SIZE_OPTIONS = ["1536x1024", "1024x1024", "1024x1536"]
-
 SERPAPI_DEFAULT = st.secrets.get("SERPAPI_API_KEY", "")
 
-# ======================
-# Small helpers
-# ======================
+# ----------------- tiny utils -----------------
 def slugify(t: str) -> str:
     t = t.lower().strip()
     t = re.sub(r"[’'`]", "", t)
@@ -68,12 +57,10 @@ def crop_to_aspect(img: Image.Image, w: int, h: int) -> Image.Image:
     W, H = img.size
     r = W / H
     if r > tr:
-        new_w = int(H * tr)
-        left = (W - new_w) // 2
+        new_w = int(H * tr); left = (W - new_w) // 2
         return img.crop((left, 0, left + new_w, H))
     else:
-        new_h = int(W / tr)
-        top = (H - new_h) // 2
+        new_h = int(W / tr); top = (H - new_h) // 2
         return img.crop((0, top, W, top + new_h))
 
 def to_webp_bytes(img: Image.Image, w: int, h: int, quality: int) -> bytes:
@@ -85,16 +72,11 @@ def to_webp_bytes(img: Image.Image, w: int, h: int, quality: int) -> bytes:
 
 def extract_json(txt: str):
     m = re.search(r"\{.*\}", txt, re.DOTALL)
-    if not m:
-        return None
-    try:
-        return json.loads(m.group(0))
-    except Exception:
-        return None
+    if not m: return None
+    try: return json.loads(m.group(0))
+    except Exception: return None
 
-# ======================
-# OpenAI
-# ======================
+# ----------------- OpenAI -----------------
 def chat_completion(api_key: str, messages: list, temperature: float = 0.6, model: str = "gpt-4o-mini") -> str:
     r = requests.post(
         "https://api.openai.com/v1/chat/completions",
@@ -119,16 +101,12 @@ def generate_image_bytes(api_key: str, prompt: str, size: str) -> bytes:
     if "b64_json" in d0:
         return base64.b64decode(d0["b64_json"])
     if "url" in d0:
-        img = requests.get(d0["url"], timeout=180)
-        img.raise_for_status()
+        img = requests.get(d0["url"], timeout=180); img.raise_for_status()
         return img.content
     raise RuntimeError("No image data returned")
 
-# ======================
-# SerpAPI — CC images & hints
-# ======================
+# ----------------- SerpAPI (CC images & hints) -----------------
 PRICE_TERMS = ["price","prices","cost","ticket","tickets","lift ticket","fee","fees","discount","coupon","how much"]
-
 def keyword_is_pricey(k: str) -> bool:
     kk = k.lower()
     return any(term in kk for term in PRICE_TERMS)
@@ -138,8 +116,7 @@ def serpapi_price_hint(api_key: str, query: str) -> Optional[str]:
         url = "https://serpapi.com/search.json"
         params = {"engine":"google","q":query,"num":5,"api_key":api_key}
         r = requests.get(url, params=params, timeout=20)
-        if r.status_code != 200:
-            return None
+        if r.status_code != 200: return None
         data = r.json()
         texts = []
         ab = data.get("answer_box") or {}
@@ -163,70 +140,59 @@ def serpapi_image_titles(api_key: str, query: str, cc_only: bool = True, max_ite
     try:
         url = "https://serpapi.com/search.json"
         params = {"engine":"google","q":query,"tbm":"isch","ijn":"0","api_key":api_key}
-        if cc_only:
-            params["tbs"] = "sur:fc"
+        if cc_only: params["tbs"] = "sur:fc"
         r = requests.get(url, params=params, timeout=20)
-        if r.status_code != 200:
-            return []
+        if r.status_code != 200: return []
         data = r.json()
         results = data.get("images_results",[])[:max_items]
         titles = []
         for it in results:
             t = it.get("title")
-            if isinstance(t,str) and t.strip():
-                titles.append(t.strip())
+            if isinstance(t,str) and t.strip(): titles.append(t.strip())
         return titles
     except Exception:
         return []
 
-def serpapi_cc_image_candidates(api_key: str, query: str, max_items: int = 6) -> List[dict]:
-    """
-    Returns a list of image dicts with keys: url, width, height, title, source.
-    CC-only via tbs=sur:fc.
-    """
+def serpapi_cc_image_candidates(api_key: str, query: str, max_items: int = 8) -> List[dict]:
+    """Return candidates with original/thumbnail URLs and metadata."""
     try:
         url = "https://serpapi.com/search.json"
         params = {"engine":"google","q":query,"tbm":"isch","ijn":"0","tbs":"sur:fc","api_key":api_key}
         r = requests.get(url, params=params, timeout=20)
-        if r.status_code != 200:
-            return []
+        if r.status_code != 200: return []
         data = r.json()
         out = []
         for it in data.get("images_results",[])[:max_items]:
-            # Prefer "original" if present, else "thumbnail"
-            image_url = it.get("original") or it.get("thumbnail") or it.get("source")
-            if not image_url:
-                continue
-            width = it.get("original_width") or it.get("width") or 0
+            original = it.get("original") or it.get("thumbnail") or it.get("source")
+            thumb   = it.get("thumbnail") or it.get("original") or it.get("source")
+            if not original: continue
+            width  = it.get("original_width") or it.get("width") or 0
             height = it.get("original_height") or it.get("height") or 0
-            title = it.get("title") or ""
-            source = it.get("source") or ""
-            out.append({"url": image_url, "width": int(width or 0), "height": int(height or 0),
-                        "title": title, "source": source})
+            out.append({
+                "original_url": original,
+                "thumbnail_url": thumb,
+                "width": int(width or 0),
+                "height": int(height or 0),
+                "title": it.get("title") or "",
+                "source": it.get("source") or "",
+            })
         return out
     except Exception:
         return []
 
 def choose_best_cc_image(cands: List[dict]) -> Optional[dict]:
-    if not cands:
-        return None
-    # pick by area (width*height)
-    best = sorted(cands, key=lambda c: (c.get("width",0)*c.get("height",0)), reverse=True)[0]
-    return best
+    if not cands: return None
+    return sorted(cands, key=lambda c: (c.get("width",0)*c.get("height",0)), reverse=True)[0]
 
 def safe_download_image(url: str) -> Optional[Image.Image]:
     try:
         resp = requests.get(url, timeout=30)
-        if resp.status_code != 200:
-            return None
-        img = Image.open(io.BytesIO(resp.content))
-        return img
+        if resp.status_code != 200: return None
+        return Image.open(io.BytesIO(resp.content))
     except Exception:
         return None
 
-# ======================
-# Season Engine
-# ======================
+# ----------------- Season Engine -----------------
 MONTH_ALIASES = {
     "january":"jan","february":"feb","march":"mar","april":"apr","may":"may","june":"jun",
     "july":"jul","august":"aug","september":"sep","october":"oct","november":"nov","december":"dec",
@@ -235,8 +201,7 @@ MONTH_ALIASES = {
 def extract_month_token(text: str) -> Optional[str]:
     t = text.lower()
     for w in re.findall(r"[a-z]+", t):
-        if w in MONTH_ALIASES:
-            return MONTH_ALIASES[w]
+        if w in MONTH_ALIASES: return MONTH_ALIASES[w]
     return None
 
 def skiish(keyword: str) -> bool:
@@ -244,40 +209,29 @@ def skiish(keyword: str) -> bool:
     return any(s in k for s in ["ski","back bowl","lift ticket","gondola","powder","snowboard","chairlift"])
 
 def season_hint_for_site(site_key: str, keyword: str) -> Optional[str]:
-    m = extract_month_token(keyword)
-    k = keyword.lower()
+    m = extract_month_token(keyword); k = keyword.lower()
     if site_key=="vailvacay.com":
-        if skiish(k):
-            return "Season: winter skiing. Snowy runs and operating lifts; winter clothing; avoid summer flowers/green meadows."
+        if skiish(k): return "Season: winter skiing. Snowy runs and operating lifts; winter clothing; avoid summer flowers/green meadows."
         if m in {"nov","dec","jan","feb","mar","apr"}:
-            if m=="apr":
-                return "Season: late-season spring skiing—snowy runs still active; sunny OK but no summer flowers."
+            if m=="apr": return "Season: late-season spring skiing—snowy runs still active; sunny OK but no summer flowers."
             return "Season: winter—snow on ski slopes; winter outfits."
-        if m=="may":
-            return "Season: shoulder—town thawed, high peaks/ski runs may retain snow; avoid full-summer flowers."
-        if m in {"jun","jul","aug"}:
-            return "Season: summer—no town snow; peaks minimal patches."
-        if m=="sep":
-            return "Season: early fall—greens fading; minimal/no snow except high peaks."
-        if m=="oct":
-            return "Season: fall—aspens turning; possible light peak dusting; no active skiing unless requested."
+        if m=="may": return "Season: shoulder—town thawed, high peaks/ski runs may retain snow; avoid full-summer flowers."
+        if m in {"jun","jul","aug"}: return "Season: summer—no town snow; peaks minimal patches."
+        if m=="sep": return "Season: early fall—greens fading; minimal/no snow except high peaks."
+        if m=="oct": return "Season: fall—aspens turning; possible light peak dusting; no active skiing unless requested."
         if "winter" in k: return "Season: winter—snowy slopes."
         if "summer" in k: return "Season: summer—no town snow."
         if "spring" in k: return "Season: mountain spring—snow can persist on runs/peaks."
     if site_key=="bostonvacay.com" and m:
-        if m in {"dec","jan","feb"}: return "Season: Boston winter; cold outfits; snow optional."
-        if m in {"jun","jul","aug"}: return "Season: summer by harbor/Charles; leafy trees."
+        if m in {"dec","jan","feb"}: return "Season: Boston winter; snow optional."
+        if m in {"jun","jul","aug"}: return "Season: summer by harbor/Charles."
         if m in {"sep","oct"}: return "Season: fall foliage tones."
-        if m in {"apr","may"}: return "Season: spring; blooming trees."
-    if site_key=="bangkokvacay.com":
-        return "Season: tropical warm; no coats or winter scenes."
+        if m in {"apr","may"}: return "Season: spring blooms."
+    if site_key=="bangkokvacay.com": return "Season: tropical warm; no coats or winter scenes."
     return None
 
-# ======================
-# Corridor Engine
-# ======================
+# ----------------- Corridor Engine -----------------
 ROUTE_SW_KEYWORDS = ["albuquerque","santa fe","taos","new mexico","nm","rio grande","gorge","mesa","pueblo","adobe","sand dunes","great sand dunes"]
-
 def parse_route_endpoints(keyword: str) -> Optional[Tuple[str,str]]:
     k = " ".join(keyword.lower().split())
     m = re.search(r"between\s+(.+?)\s+and\s+(.+)$", k)
@@ -288,8 +242,7 @@ def parse_route_endpoints(keyword: str) -> Optional[Tuple[str,str]]:
 
 def corridor_hint_for_route(site_key: str, keyword: str) -> Optional[str]:
     endpoints = parse_route_endpoints(keyword)
-    if not endpoints:
-        return None
+    if not endpoints: return None
     k = keyword.lower()
     generic = ("Road-trip corridor scene: highway or scenic overlook, or dash+map angle. "
                "Brown park sign/mile marker in soft focus. No brand signage; avoid resort artifacts like gondolas/chairlifts/base lodges.")
@@ -298,9 +251,7 @@ def corridor_hint_for_route(site_key: str, keyword: str) -> Optional[str]:
                 "icons like Rio Grande Gorge Bridge or Great Sand Dunes distant. No alpine gondolas.")
     return generic
 
-# ======================
-# Planner + Critic (AI)
-# ======================
+# ----------------- Planner + Critic -----------------
 PLANNER_BASE = """
 You are a senior creative director writing photorealistic image briefs for a travel/consumer blog.
 Given a keyword and a site vibe, craft ONE concise prompt (1–2 sentences) for a DALLE-like model.
@@ -313,7 +264,6 @@ Nudges/examples:
 - "what mountain range is … in": emphasize ridgelines/peaks; town minimal.
 - "how far/between/from …": road-trip planning vibe (highway/overlook; optional dash+map); keep brand signage unreadable.
 """
-
 SITE_NUDGES = {
     "vailvacay.com": [
         "If topic implies skiing (back bowls/lift tickets), show snowy slopes and lift infrastructure.",
@@ -321,22 +271,16 @@ SITE_NUDGES = {
     ],
     "bostonvacay.com": [
         "Ferry/Bar Harbor: terminal/ramp scene with vessel; signage generic/debranded.",
-        "Wardrobe by season; no visible logos.",
     ],
     "bangkokvacay.com": [
-        "BTS/Chinatown: platform train arrival; wayfinding shapes suggestive but unreadable; lantern hints; non-explicit nightlife.",
+        "BTS/Chinatown: platform train arrival; wayfinding shapes suggestive but unreadable.",
     ],
-    "ipetzo.com": [
-        "Dog-friendly: patio/lobby seating; water bowl; no hotel branding."
-    ],
-    "1-800deals.com": [
-        "Deals/unboxing: generic parcels/product tableaus; device screens out-of-focus; no trademarks."
-    ],
+    "ipetzo.com": ["Dog-friendly: patio/lobby seating; water bowl; no hotel branding."],
+    "1-800deals.com": ["Deals/unboxing: generic parcels/product tableaus; device screens out-of-focus; no trademarks."],
 }
-
 CRITIC_SYSTEM = """
 You are a prompt critic. Ensure the prompt clearly illustrates the keyword, honors any season/corridor directives,
-keeps brand-neutrality (no readable logos/text), and is concise. For price/ticket topics, forbid readable numbers and use a conceptual scene.
+keeps brand-neutrality (no readable logos/text), and is concise. For price/ticket topics, forbid readable numbers.
 If it needs improvement, return {"action":"refine","prompt":"..."}; otherwise {"action":"ok"}.
 """
 
@@ -351,10 +295,8 @@ def build_planner_system(site_key: str,
     facts_block = f"\nContext (for concept only; do NOT render text/numbers):\n- {facts_hint}\n" if facts_hint else ""
     season_block = f"\nSeason directive (MUST follow):\n- {season_hint}\n" if season_hint else ""
     corridor_block = f"\nCorridor directive (MUST follow):\n- {corridor_hint}\n" if corridor_hint else ""
-    cues_block = ""
-    if ref_cues:
-        cues_block = ("\nReference cues (from public image titles; inspiration only; no text/logos):\n- "
-                      + "\n- ".join(ref_cues[:6]) + "\n")
+    cues_block = ("\nReference cues (from public image titles; inspiration only; no text/logos):\n- "
+                  + "\n- ".join(ref_cues[:6]) + "\n") if ref_cues else ""
     return (PLANNER_BASE.replace("{ORIENTATION_NOTE}", orientation_note)
             + site_block + season_block + corridor_block + facts_block + cues_block
             + '\nOutput JSON ONLY:\n{"prompt": "<final one- or two-sentence prompt>"}')
@@ -377,12 +319,9 @@ def critique_and_refine(api_key: str, keyword: str, prompt: str) -> str:
         return data["prompt"]
     return prompt
 
-# ======================
-# LSI variants
-# ======================
+# ----------------- LSI variants -----------------
 def generate_lsi_variants(api_key: str, main_keyword: str, site_key: str, count: int) -> List[str]:
-    if count <= 0:
-        return []
+    if count <= 0: return []
     system = ("You are an SEO strategist. Given a main keyword, produce concise LSI variants suitable for distinct images. "
               "Keep any month/season/location in place. Avoid brands/names/explicit content. "
               "Return JSON ONLY: {\"variants\": [\"...\"]}")
@@ -406,27 +345,20 @@ def generate_lsi_variants(api_key: str, main_keyword: str, site_key: str, count:
         if len(out)>=count: break
     return out
 
-# ======================
-# Place-query detection (when to try CC photos)
-# ======================
+# ----------------- Place detection -----------------
 VENUE_HINTS = [
     "restaurant","tavern","bar","cafe","coffee","roaster","bakery","diner","eatery","steakhouse","sushi",
     "hotel","lodge","inn","resort","hostel","motel","spa",
     "shop","store","boutique","outfitter","market","mall","plaza","center","centre",
     "museum","gallery","theater","theatre","park","trail","gondola","terminal","station","ferry","pier",
 ]
-
 def looks_like_place_query(keyword: str) -> bool:
     k = keyword.lower()
-    if any(h in k for h in VENUE_HINTS):
-        return True
-    # Heuristic: contains a comma + city/state words
-    if "," in k and any(city in k for city in ["vail","boston","bangkok","colorado","massachusetts","thailand"]):
-        return True
-    # Contains title-cased phrase?
+    if any(h in k for h in VENUE_HINTS): return True
+    if "," in k and any(city in k for city in ["vail","boston","bangkok","colorado","massachusetts","thailand"]): return True
     words = re.findall(r"[A-Za-z][A-Za-z']+", keyword)
     caps = sum(1 for w in words if w[:1].isupper())
-    return caps >= 3  # many proper nouns
+    return caps >= 3
 
 def build_cc_queries(keyword: str, site_key: str) -> List[str]:
     base_city = {
@@ -437,50 +369,28 @@ def build_cc_queries(keyword: str, site_key: str) -> List[str]:
         "1-800deals.com": ""
     }.get(site_key, "")
     q0 = f"{keyword} {base_city}".strip()
-    variants = [
-        q0,
-        f"{keyword} storefront {base_city}".strip(),
-        f"{keyword} exterior {base_city}".strip(),
-        f"{keyword} sign {base_city}".strip(),
-        f"\"{keyword}\" {base_city}".strip(),
-    ]
-    # Deduplicate while preserving order
+    variants = [q0,
+                f"{keyword} storefront {base_city}".strip(),
+                f"{keyword} exterior {base_city}".strip(),
+                f"{keyword} sign {base_city}".strip(),
+                f"\"{keyword}\" {base_city}".strip()]
     seen, out = set(), []
     for q in variants:
         if q and q not in seen:
             out.append(q); seen.add(q)
     return out
 
-# ======================
-# Real/Replica pipeline
-# ======================
-def try_real_cc_photo(serpapi_key: str, queries: List[str]) -> Optional[Tuple[Image.Image, dict]]:
-    """Return (PIL.Image, meta) or None."""
-    if not serpapi_key:
-        return None
-    for q in queries:
-        cands = serpapi_cc_image_candidates(serpapi_key, q, max_items=6)
-        best = choose_best_cc_image(cands)
-        if best:
-            img = safe_download_image(best["url"])
-            if img:
-                return img, best
-    return None
-
 def choose_render_size_for_orientation(chosen_size: str, orientation_note: str) -> str:
     portrait = "portrait" in orientation_note
-    if portrait and chosen_size != "1024x1536":
-        return "1024x1536"
-    if (not portrait) and chosen_size == "1024x1536":
-        return "1536x1024"
+    if portrait and chosen_size != "1024x1536": return "1024x1536"
+    if (not portrait) and chosen_size == "1024x1536": return "1536x1024"
     return chosen_size
 
-# ======================
-# UI
-# ======================
+# ----------------- Streamlit UI -----------------
 st.title(f"{APP_NAME} — {APP_VERSION}")
-st.caption("Paste keywords (one per line). Default: Hands-free Real/Replica — uses CC storefront photos when available "
-           "and falls back to brand-neutral AI replicas. Season & Corridor Engines included. LSI variants supported.")
+st.caption("Enable **Preview CC candidates** to see thumbnails and manually pick which real photo to use. "
+           "If none is picked (or none found), we generate a brand-neutral AI replica. "
+           "Season & Corridor Engines included. LSI supported.")
 
 if APP_PASSWORD:
     if st.text_input("Team password", type="password") != APP_PASSWORD:
@@ -491,55 +401,59 @@ with st.sidebar:
                         index=list(SITE_PRESETS.keys()).index(DEFAULT_SITE))
     output_preset = st.selectbox("Output preset", list(OUTPUT_PRESETS.keys()),
                                  index=list(OUTPUT_PRESETS.keys()).index(DEFAULT_OUTPUT_PRESET))
-    images_per_kw = st.number_input("Images per keyword", min_value=1, max_value=12, value=1, step=1,
-                                    help="If >1, we generate N−1 LSI variants per keyword.")
+    images_per_kw = st.number_input("Images per keyword", min_value=1, max_value=12, value=1, step=1)
     quality = st.slider("WebP quality", 60, 95, DEFAULT_QUALITY)
 
-    render_size = st.selectbox("Model render size (internal)", API_IMAGE_SIZE_OPTIONS, index=0,
-                               help="Pinterest works best with 1024×1536; we auto-adjust to match orientation.")
+    render_size = st.selectbox("Model render size (internal)", API_IMAGE_SIZE_OPTIONS, index=0)
 
     source_mode = st.radio("Source mode",
-                           ["Hands-free Real/Replica (CC first)", "AI only", "Real-only CC (skip if none)"],
-                           help="Real photos only when Creative-Commons via Google Images (SerpAPI). "
-                                "If none found: fallback to AI (first option) or skip (third option).")
+                           ["Hands-free Real/Replica (CC first)", "AI only", "Real-only CC (skip if none)"])
+    preview_cc = st.checkbox("Preview CC candidates (manual pick)", value=True,
+                             help="Shows 3–8 CC thumbnails per place keyword. You choose which one to use "
+                                  "or select AI replica/Skip per item.")
+
     serpapi_key = st.text_input("SERPAPI_API_KEY (optional)", type="password",
-                                value=SERPAPI_DEFAULT, help="Needed for CC photos & search cues.")
-
+                                value=st.secrets.get("SERPAPI_API_KEY",""))
 openai_key = st.text_input("OpenAI API key", type="password",
-                           value=st.secrets.get("OPENAI_API_KEY",""),
-                           help="Set in Secrets for convenience.")
+                           value=st.secrets.get("OPENAI_API_KEY",""))
 
-keywords_text = st.text_area("Keywords (one per line)", height=260,
-                             placeholder="Tavern on the Square, Vail Colorado\nBest seafood restaurant in Boston\nThings to see between Vail and Albuquerque")
+keywords_text = st.text_area("Keywords (one per line)", height=240,
+                             placeholder="Tavern on the Square, Vail Colorado\nBest seafood restaurant in Boston")
 
-c1, c2 = st.columns(2)
-run = c1.button("Generate")
-if c2.button("Clear"):
+c1, c2, c3 = st.columns([1,1,1])
+btn_search = c1.button("Search & Preview" if preview_cc else "Generate")
+btn_render = c2.button("Render Images")
+btn_clear = c3.button("Clear")
+
+if btn_clear:
     st.session_state.clear()
     st.experimental_rerun()
 
-# ======================
-# Generation helpers
-# ======================
+# ----------------- Session state buckets -----------------
+ss = st.session_state
+ss.setdefault("work_items", [])             # list of (main_kw, actual_kw, work_id)
+ss.setdefault("lsi_record", {})             # main_kw -> [lsi]
+ss.setdefault("cc_candidates", {})          # work_id -> [candidate dict]
+ss.setdefault("cc_pick", {})                # work_id -> {"mode": "cc"/"ai"/"skip", "index": int}
+ss.setdefault("out_cfg", OUTPUT_PRESETS[output_preset])
+ss.setdefault("render_plan_ready", False)
+
+# ----------------- AI generation helpers -----------------
 def do_ai_image(api_key: str, keyword: str, site_key: str,
                 out_cfg: dict, chosen_render_size: str,
                 serpapi_key: str) -> Tuple[str, bytes, Optional[str], List[str]]:
-    """Return (prompt_used, webp_bytes, facts_hint, ref_cues) for AI path."""
     site_vibe = SITE_PRESETS.get(site_key, SITE_PRESETS[DEFAULT_SITE])
     W, H = out_cfg["w"], out_cfg["h"]
     orientation_note = out_cfg["orientation_note"]
-    render_size = choose_render_size_for_orientation(chosen_render_size, orientation_note)
+    render_sz = choose_render_size_for_orientation(chosen_render_size, orientation_note)
 
-    # Season & Corridor
     season_hint = season_hint_for_site(site_key, keyword)
     corridor_hint = corridor_hint_for_route(site_key, keyword)
 
-    # Optional price hint
     facts_hint = None
     if serpapi_key and keyword_is_pricey(keyword):
         facts_hint = serpapi_price_hint(serpapi_key, f"{keyword} {site_key.split('.')[0]}")
 
-    # Optional reference cues (titles)
     ref_titles = serpapi_image_titles(serpapi_key, f"{keyword} {site_key.split('.')[0]}", cc_only=True, max_items=5) if serpapi_key else []
     ref_cues = []
     if ref_titles:
@@ -552,119 +466,245 @@ def do_ai_image(api_key: str, keyword: str, site_key: str,
         data = extract_json(content) or {}
         ref_cues = [str(c)[:100] for c in data.get("cues",[]) if isinstance(c,str)][:6]
 
-    # Plan + Critique
     base = plan_prompt(api_key, site_vibe, keyword, site_key, facts_hint, ref_cues, season_hint, corridor_hint, orientation_note)
     prompt = critique_and_refine(api_key, keyword, base)
 
-    # Generate → crop → WebP
-    png = generate_image_bytes(api_key, prompt, render_size)
+    png = generate_image_bytes(api_key, prompt, render_sz)
     img = Image.open(io.BytesIO(png))
     return prompt, to_webp_bytes(img, W, H, quality), facts_hint, ref_cues
 
-# ======================
-# Run
-# ======================
-if run:
-    if not openai_key and source_mode != "Real-only CC (skip if none)":
-        st.warning("Please enter your OpenAI API key.")
-        st.stop()
+# ----------------- Step 1: Search & Preview -----------------
+if btn_search:
+    if preview_cc and source_mode == "AI only":
+        st.info("Preview is off for AI-only mode. Switch to a Real/Replica mode to use CC preview.")
 
+    # Build work items + LSI
+    out_cfg = OUTPUT_PRESETS[output_preset]
+    ss["out_cfg"] = out_cfg
     base_kws = [ln.strip() for ln in keywords_text.splitlines() if ln.strip()]
     if not base_kws:
         st.warning("Please paste at least one keyword.")
         st.stop()
 
-    out_cfg = OUTPUT_PRESETS[output_preset]
-
-    # Build LSI worklist
-    work_items: List[Tuple[str,str]] = []
-    lsi_record: Dict[str,List[str]] = {}
+    work_items = []
+    lsi_record = {}
     for main_kw in base_kws:
         need = max(0, images_per_kw - 1)
-        lsi = generate_lsi_variants(openai_key, main_kw, site, need) if need>0 else []
+        lsi = generate_lsi_variants(openai_key, main_kw, site, need) if (need>0 and openai_key) else []
         lsi_record[main_kw] = lsi
-        work_items.append((main_kw, main_kw))
+        work_items.append((main_kw, main_kw, slugify(main_kw)))
         for v in lsi:
-            work_items.append((main_kw, v))
+            work_items.append((main_kw, v, f"{slugify(main_kw)}--{slugify(v)}"))
 
-    total = len(work_items)
-    prog = st.progress(0)
-    status = st.empty()
-    done = 0
+    ss["work_items"] = work_items
+    ss["lsi_record"] = lsi_record
+    ss["cc_candidates"] = {}
+    ss["cc_pick"] = {}
+    ss["render_plan_ready"] = False
 
+    # If preview enabled and not AI-only, fetch candidates
+    if preview_cc and source_mode != "AI only" and serpapi_key:
+        st.success("CC search started…")
+        for _main, actual, work_id in work_items:
+            if looks_like_place_query(actual):
+                queries = build_cc_queries(actual, site)
+                all_cands = []
+                for q in queries:
+                    cands = serpapi_cc_image_candidates(serpapi_key, q, max_items=8)
+                    # prefer unique (by original_url)
+                    seen, uniq = set(), []
+                    for c in cands:
+                        url = c.get("original_url")
+                        if url and url not in seen:
+                            uniq.append(c); seen.add(url)
+                    all_cands.extend(uniq)
+                    if len(all_cands) >= 8:
+                        break
+                ss["cc_candidates"][work_id] = all_cands[:8]
+            else:
+                ss["cc_candidates"][work_id] = []  # not a place or no candidates
+        st.toast("CC candidates fetched. Review below and set your choices, then click **Render Images**.", icon="✅")
+    else:
+        # No preview path → go straight to render on next click
+        st.info("No CC preview (either disabled, AI-only, or missing SerpAPI). Click **Render Images** to generate.")
+
+# ----------------- CC Preview UI -----------------
+if preview_cc and source_mode != "AI only" and ss["work_items"]:
+    st.markdown("## CC Candidates (manual pick)")
+    for (main_kw, actual_kw, work_id) in ss["work_items"]:
+        cands = ss["cc_candidates"].get(work_id, [])
+        if not cands:
+            continue  # nothing to preview for this item
+        st.markdown(f"**{actual_kw}**")
+        # radio: choose AI/Skip or one of candidates by index
+        opt_labels = []
+        opt_values = []
+        for i, c in enumerate(cands):
+            title = (c.get("title") or "").strip()
+            host  = (c.get("source") or "").strip()
+            label = f"CC #{i+1} — {title[:70]} [{' from ' + host if host else ''}]"
+            opt_labels.append(label); opt_values.append(f"cc:{i}")
+        # extra options depending on source mode
+        if source_mode == "Real-only CC (skip if none)":
+            opt_labels = ["Skip this item"] + opt_labels
+            opt_values = ["skip"] + opt_values
+            default = "skip"
+        else:
+            opt_labels = ["AI replica"] + opt_labels
+            opt_values = ["ai"] + opt_values
+            default = "ai"
+
+        choice = st.radio("Pick one:", options=opt_values, index=0,
+                          format_func=lambda v: opt_labels[opt_values.index(v)],
+                          key=f"pick_{work_id}")
+        ss["cc_pick"][work_id] = {"mode": choice.split(":")[0],
+                                  "index": int(choice.split(":")[1]) if choice.startswith("cc:") else -1}
+
+        # show thumbs in a row
+        cols = st.columns(4)
+        for i, c in enumerate(cands[:8]):
+            with cols[i % 4]:
+                st.image(c.get("thumbnail_url") or c.get("original_url"),
+                         caption=f"CC #{i+1}", use_container_width=True)
+
+    if ss["cc_candidates"]:
+        ss["render_plan_ready"] = True
+
+# ----------------- Step 2: Render -----------------
+if btn_render:
+    if not ss["work_items"]:
+        st.warning("Click **Search & Preview** first (or disable preview and click **Generate**).")
+        st.stop()
+
+    out_cfg = ss["out_cfg"]
+    W, H = out_cfg["w"], out_cfg["h"]
+
+    # If preview was requested and we have candidates, require picks (or defaulted earlier)
+    if preview_cc and source_mode != "AI only" and not ss.get("render_plan_ready"):
+        st.warning("No CC candidates were prepared yet. Click **Search & Preview** first.")
+        st.stop()
+
+    # Render loop
+    prog = st.progress(0); done = 0
     thumbs: List[Tuple[str, bytes]] = []
     meta_log: List[str] = []
     prompts_used: List[Tuple[str, str]] = []
     facts_notes: List[Tuple[str, str]] = []
     ref_notes: List[Tuple[str, List[str]]] = []
-
-    # Prepare ZIP and attribution
-    zip_buf = io.BytesIO()
-    zipf = zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED)
     attribution_lines: List[str] = []
 
-    for main_kw, actual_kw in work_items:
-        status.text(f"Processing {done+1}/{total}: {actual_kw}")
-        fname_base = slugify(main_kw) if main_kw.lower()==actual_kw.lower() else f"{slugify(main_kw)}--{slugify(actual_kw)}"
+    zip_buf = io.BytesIO()
+    zipf = zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED)
 
+    for (main_kw, actual_kw, work_id) in ss["work_items"]:
+        fname_base = work_id
         used_real = False
         webp_bytes = None
         prompt_used = None
 
-        # Should we attempt CC real photo?
         tried_cc = False
-        if source_mode != "AI only" and serpapi_key and looks_like_place_query(actual_kw):
-            tried_cc = True
-            queries = build_cc_queries(actual_kw, site)
-            res = try_real_cc_photo(serpapi_key, queries)
-            if res:
-                img, meta = res
-                # Crop & save
-                webp_bytes = to_webp_bytes(img, out_cfg["w"], out_cfg["h"], quality)
-                used_real = True
-                meta_log.append(f"{actual_kw} → CC photo used ({meta.get('source','')} | {meta.get('title','')})")
-                attribution_lines.append(
-                    f"{fname_base} -- CC image via Google Images (SerpAPI): {meta.get('url','')} | "
-                    f"Title: {meta.get('title','')} | Source: {meta.get('source','')}"
-                )
+        cands = ss["cc_candidates"].get(work_id, [])
+        pick = ss["cc_pick"].get(work_id, {"mode":"ai","index":-1})
 
-        # If not using real, choose fallback based on mode
-        if not used_real:
-            if source_mode == "Real-only CC (skip if none)" and tried_cc:
-                meta_log.append(f"{actual_kw} → skipped (no CC photo found)")
-                done += 1; prog.progress(done/total)
-                continue
-            # AI path (brand-neutral)
-            try:
-                prompt_used, webp_bytes, facts_hint, ref_cues = do_ai_image(
-                    openai_key, actual_kw, site, out_cfg, render_size, serpapi_key
-                )
-                prompts_used.append((f"{fname_base}.webp", prompt_used))
-                if facts_hint:
-                    facts_notes.append((fname_base, facts_hint))
-                if ref_cues:
-                    ref_notes.append((fname_base, ref_cues))
-                meta_log.append(f"{actual_kw} → AI replica")
-            except Exception as e:
-                st.error(f"{actual_kw}: {e}")
-                done += 1; prog.progress(done/total)
-                continue
+        # Non-preview modes: emulate old behavior
+        if not preview_cc or source_mode=="AI only" or not cands:
+            if source_mode != "AI only" and serpapi_key and looks_like_place_query(actual_kw):
+                tried_cc = True
+                # hands-free or real-only auto pick
+                if cands:
+                    best = choose_best_cc_image(cands)
+                else:
+                    # fetch ad-hoc (no preview)
+                    allq = build_cc_queries(actual_kw, site)
+                    allc = []
+                    for q in allq:
+                        allc.extend(serpapi_cc_image_candidates(serpapi_key, q, max_items=6))
+                    best = choose_best_cc_image(allc)
+                if best:
+                    img = safe_download_image(best["original_url"])
+                    if img:
+                        webp_bytes = to_webp_bytes(img, W, H, quality)
+                        used_real = True
+                        meta_log.append(f"{actual_kw} → CC photo (auto)")
+                        attribution_lines.append(
+                            f"{fname_base} -- CC via Google Images (SerpAPI): {best.get('original_url','')} | "
+                            f"Title: {best.get('title','')} | Source: {best.get('source','')}"
+                        )
 
-        # Write file
+            if not used_real:
+                if source_mode == "Real-only CC (skip if none)" and tried_cc:
+                    meta_log.append(f"{actual_kw} → skipped (no CC photo)")
+                    done += 1; prog.progress(done/len(ss['work_items'])); continue
+                # AI
+                if not openai_key:
+                    st.error("OpenAI key required for AI replica.")
+                    st.stop()
+                try:
+                    prompt_used, webp_bytes, facts_hint, ref_cues = do_ai_image(
+                        openai_key, actual_kw, site, out_cfg, render_size, serpapi_key
+                    )
+                    prompts_used.append((f"{fname_base}.webp", prompt_used))
+                    if facts_hint: facts_notes.append((fname_base, facts_hint))
+                    if ref_cues: ref_notes.append((fname_base, ref_cues))
+                    meta_log.append(f"{actual_kw} → AI replica")
+                except Exception as e:
+                    st.error(f"{actual_kw}: {e}")
+                    done += 1; prog.progress(done/len(ss['work_items'])); continue
+
+        else:
+            # Preview mode with candidates & a pick
+            mode = pick.get("mode","ai")
+            idx  = pick.get("index",-1)
+            if mode == "cc" and 0 <= idx < len(cands):
+                tried_cc = True
+                cand = cands[idx]
+                img = safe_download_image(cand["original_url"])
+                if img:
+                    webp_bytes = to_webp_bytes(img, W, H, quality)
+                    used_real = True
+                    meta_log.append(f"{actual_kw} → CC photo (manual pick)")
+                    attribution_lines.append(
+                        f"{fname_base} -- CC via Google Images (SerpAPI): {cand.get('original_url','')} | "
+                        f"Title: {cand.get('title','')} | Source: {cand.get('source','')}"
+                    )
+                else:
+                    meta_log.append(f"{actual_kw} → chosen CC failed to download; using AI replica")
+            elif mode == "skip":
+                meta_log.append(f"{actual_kw} → skipped by user")
+                done += 1; prog.progress(done/len(ss['work_items'])); continue
+
+            if not used_real:
+                if source_mode == "Real-only CC (skip if none)":
+                    meta_log.append(f"{actual_kw} → skipped (no CC used)")
+                    done += 1; prog.progress(done/len(ss['work_items'])); continue
+                if not openai_key:
+                    st.error("OpenAI key required for AI replica."); st.stop()
+                try:
+                    prompt_used, webp_bytes, facts_hint, ref_cues = do_ai_image(
+                        openai_key, actual_kw, site, out_cfg, render_size, serpapi_key
+                    )
+                    prompts_used.append((f"{fname_base}.webp", prompt_used))
+                    if facts_hint: facts_notes.append((fname_base, facts_hint))
+                    if ref_cues: ref_notes.append((fname_base, ref_cues))
+                    meta_log.append(f"{actual_kw} → AI replica")
+                except Exception as e:
+                    st.error(f"{actual_kw}: {e}")
+                    done += 1; prog.progress(done/len(ss['work_items'])); continue
+
+        # write file
         if webp_bytes:
             suffix = "photo-cc" if used_real else "replica"
-            out_name = f"{fname_base}--{suffix}.webp" if tried_cc else f"{fname_base}.webp"
+            out_name = f"{fname_base}--{suffix}.webp" if tried_cc or preview_cc else f"{fname_base}.webp"
             zipf.writestr(out_name, webp_bytes)
             thumbs.append((out_name, webp_bytes))
 
         done += 1
-        prog.progress(done/total)
+        prog.progress(done/len(ss["work_items"]))
 
-    # Finish ZIP
+    # finalize ZIP
     if attribution_lines:
         zipf.writestr("ATTRIBUTION.txt", "\n".join(attribution_lines))
-    zipf.close()
-    zip_buf.seek(0)
+    zipf.close(); zip_buf.seek(0)
 
     if not thumbs:
         st.error("No images were produced.")
@@ -675,7 +715,7 @@ if run:
                            mime="application/zip")
 
         st.markdown("### Previews")
-        cols = st.columns(3 if out_cfg['h'] <= out_cfg['w'] else 2)
+        cols = st.columns(3 if H <= W else 2)
         for i,(name, data_bytes) in enumerate(thumbs):
             with cols[i % len(cols)]:
                 st.image(data_bytes, caption=name, use_container_width=True)
@@ -683,29 +723,25 @@ if run:
 
         if meta_log:
             with st.expander("Run log"):
-                for line in meta_log:
-                    st.write("• " + line)
+                for line in meta_log: st.write("• " + line)
+
+        if ss["lsi_record"]:
+            with st.expander("LSI variants generated"):
+                for main_kw, variants in ss["lsi_record"].items():
+                    st.markdown(f"**{main_kw}**")
+                    st.write(", ".join(variants) if variants else "_None_")
 
         if prompts_used:
             with st.expander("Prompts used (AI only)"):
                 for fname, p in prompts_used:
-                    st.markdown(f"**{fname}**")
-                    st.code(p, language="text")
-
-        if lsi_record:
-            with st.expander("LSI variants generated"):
-                for main_kw, variants in lsi_record.items():
-                    st.markdown(f"**{main_kw}**")
-                    st.write(", ".join(variants) if variants else "_None_")
+                    st.markdown(f"**{fname}**"); st.code(p, language="text")
 
         if facts_notes:
             with st.expander("Price facts assist (reference only)"):
                 for fname, note in facts_notes:
-                    st.markdown(f"**{fname}**")
-                    st.write(note)
+                    st.markdown(f"**{fname}**"); st.write(note)
 
         if ref_notes:
             with st.expander("Reference cues used"):
                 for fname, cues in ref_notes:
-                    st.markdown(f"**{fname}**")
-                    st.write(", ".join(cues))
+                    st.markdown(f"**{fname}**"); st.write(", ".join(cues))
