@@ -1,22 +1,22 @@
-# ImageForge v1.1.1 — Real-First + References + LSI (robust image validation)
-# - Real photos first: Google Places Photos -> Street View -> Openverse (CC)
-# - Optional SerpAPI reference thumbnails (never exported to ZIP)
-# - Optional OpenAI fallback if no real photo is found
-# - Heuristic LSI: multiple images per keyword
+# ImageForge v1.2 — Real-First + References + LSI (manual pick = 2-step, one choice per keyword)
+# - Step 1: Generate -> show candidates (Places/Street View/Openverse/SerpAPI refs)
+# - Step 2: Pick one per keyword (single select) -> Build images from my selections
+# - Strict image-byte validation to avoid crashes
 # - 1200x675 WebP (+ optional 1000x1500 Pinterest), metadata.csv
-# - NEW: strict image-byte validation to avoid PIL.UnidentifiedImageError
+# - LSI expansion (heuristic), optional OpenAI fallback
 
-import io, os, re, zipfile, time, json, base64
+import io, re, zipfile, base64
 from typing import List, Optional
 from dataclasses import dataclass
+
 import requests
 from PIL import Image
 import streamlit as st
 import pandas as pd
 
-st.set_page_config(page_title="ImageForge v1.1.1 — Real-First + References + LSI", layout="wide")
+st.set_page_config(page_title="ImageForge v1.2 — Real-First + References + LSI", layout="wide")
 
-APP_TITLE = "ImageForge v1.1.1 — Real-First + References + LSI"
+APP_TITLE = "ImageForge v1.2 — Real-First + References + LSI"
 TARGET_W, TARGET_H = 1200, 675
 PINTEREST_W, PINTEREST_H = 1000, 1500
 DEFAULT_QUALITY = 82
@@ -31,7 +31,7 @@ SITE_PROFILES = {
 }
 DEFAULT_SITE = "vailvacay.com"
 
-# ---------- Utils ----------
+# ---------------- Utils ----------------
 
 def slugify(text: str) -> str:
     t = text.lower().strip()
@@ -56,13 +56,12 @@ def is_image_bytes(b: Optional[bytes]) -> bool:
         return False
     try:
         im = Image.open(io.BytesIO(b))
-        im.verify()  # quick check
+        im.verify()
         return True
     except Exception:
         return False
 
 def to_webp_bytes(img_bytes: bytes, target_w: int, target_h: int, quality: int) -> bytes:
-    # Re-open after verify for actual processing
     img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
     img = crop_to_aspect(img, target_w, target_h).resize((target_w, target_h), Image.LANCZOS)
     buf = io.BytesIO()
@@ -76,7 +75,6 @@ def get_image_bytes(url: str, timeout: int = 25) -> Optional[bytes]:
             return None
         ct = r.headers.get("content-type", "")
         data = r.content
-        # accept if header says image OR bytes pass PIL verify
         if ct.startswith("image/") or is_image_bytes(data):
             return data
     except Exception:
@@ -101,7 +99,7 @@ def valid_candidate(c: Optional[Candidate]) -> bool:
         and is_image_bytes(c.full_bytes)
     )
 
-# ---------- Sources ----------
+# ---------------- Sources ----------------
 
 def google_places_candidates(query: str, key: str, max_photos: int = 4) -> List[Candidate]:
     out: List[Candidate] = []
@@ -234,7 +232,7 @@ def serpapi_reference_images(query: str, key: str, n: int = 6) -> List[Candidate
         pass
     return out
 
-# ---------- AI fallback ----------
+# ---------------- AI fallback ----------------
 
 def build_ai_prompt(site: str, keyword: str) -> str:
     base = SITE_PROFILES.get(site, SITE_PROFILES[DEFAULT_SITE])
@@ -249,7 +247,7 @@ def openai_generate_image_bytes(prompt: str, size: str, api_key: str) -> Optiona
         url = "https://api.openai.com/v1/images/generations"
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
-        # 1) Default (URL)
+        # Try URL first
         payload = {"model": "gpt-image-1", "prompt": prompt, "size": size}
         r = requests.post(url, headers=headers, json=payload, timeout=60)
         if r.status_code == 200:
@@ -263,7 +261,7 @@ def openai_generate_image_bytes(prompt: str, size: str, api_key: str) -> Optiona
                 if is_image_bytes(data):
                     return data
 
-        # 2) Explicit b64 fallback
+        # Fallback to explicit b64
         payload = {"model":"gpt-image-1","prompt":prompt,"size":size,"response_format":"b64_json"}
         r = requests.post(url, headers=headers, json=payload, timeout=60)
         if r.status_code == 200:
@@ -276,7 +274,7 @@ def openai_generate_image_bytes(prompt: str, size: str, api_key: str) -> Optiona
         pass
     return None
 
-# ---------- LSI ----------
+# ---------------- LSI ----------------
 
 def lsi_expand(keyword: str, count: int) -> List[str]:
     if count <= 1:
@@ -305,10 +303,10 @@ def lsi_expand(keyword: str, count: int) -> List[str]:
             break
     return out[:count]
 
-# ---------- UI ----------
+# ---------------- UI ----------------
 
 st.title(APP_TITLE)
-st.caption("Real photos first (Places/Street View/Openverse). Optional SerpAPI references. Optional OpenAI fallback only if nothing real is found.")
+st.caption("Two-step manual pick: Generate → choose one per keyword → Build images. Real photos first, AI only if needed.")
 
 with st.sidebar:
     st.header("Keys")
@@ -330,7 +328,7 @@ with st.sidebar:
     use_serpapi_refs = st.checkbox("SerpAPI thumbnails (reference only)", value=True if serpapi_key else False)
 
     st.header("Picker & LSI")
-    manual_pick = st.selectbox("Thumbnail picking", ["Manual pick thumbnails", "Auto-best"], index=0)
+    manual_pick = st.selectbox("Thumbnail picking", ["Manual pick thumbnails (2-step)", "Auto-best"], index=0)
     imgs_per_kw = st.number_input("Images per keyword (LSI expansion)", min_value=1, max_value=20, value=1)
     lsi_method = st.selectbox("LSI method", ["Heuristic"], index=0)
 
@@ -339,32 +337,27 @@ with st.sidebar:
     allow_ai_fallback = st.checkbox("Allow AI fallback if no real photo found", value=False)
 
 st.subheader("Paste keywords (one per line)")
-kw_text = st.text_area("", height=180, placeholder="Tavern on the Square, Vail Colorado\nBest seafood restaurant in Boston\nThings to do in Vail in October")
+kw_text = st.text_area("", height=180, placeholder="Blue Moose Pizza in Vail Colorado\nTavern on the Square, Vail Colorado\nBest seafood restaurant in Boston")
+
 colA, colB = st.columns([1,1])
-run_btn = colA.button("Generate")
-clr_btn = colB.button("Clear")
-if clr_btn:
+generate_btn = colA.button("Generate")
+clear_btn = colB.button("Clear")
+if clear_btn:
     st.session_state.clear()
     st.experimental_rerun()
 
-# ---------- Core ----------
+# ---------------- Collect ----------------
 
 def collect_candidates_for_query(q: str) -> List[Candidate]:
     cands: List[Candidate] = []
-
     if use_places and google_key:
         cands += google_places_candidates(q, google_key, max_photos=4)
-
     if use_street and google_key:
         cands += google_streetview_candidate(q, google_key)
-
     if use_openverse:
         cands += openverse_cc_candidates(q, max_results=6)
-
     if use_serpapi_refs and serpapi_key:
         cands += serpapi_reference_images(q, serpapi_key, n=6)
-
-    # HARD FILTER: drop anything that isn't valid image bytes
     cands = [c for c in cands if valid_candidate(c)]
     return cands
 
@@ -405,146 +398,153 @@ def ai_image_for(q: str) -> Optional[bytes]:
     img_bytes = openai_generate_image_bytes(prompt, size=base_size, api_key=openai_key)
     return img_bytes if is_image_bytes(img_bytes) else None
 
-def save_rows_to_zip(zipf, rows, pinterest: bool, quality: int):
-    for row in rows:
-        if row["reference_only"]:
+def build_zip(rows, pinterest: bool, quality: int) -> bytes:
+    buf = io.BytesIO()
+    z = zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED)
+    for r in rows:
+        if r["reference_only"]:
             continue
-        webp = to_webp_bytes(row["raw_bytes"], TARGET_W, TARGET_H, quality)
-        zipf.writestr(row["filename"], webp)
+        webp = to_webp_bytes(r["raw_bytes"], TARGET_W, TARGET_H, quality)
+        z.writestr(r["filename"], webp)
         if pinterest:
-            pin = to_webp_bytes(row["raw_bytes"], PINTEREST_W, PINTEREST_H, quality)
-            base = row["filename"].rsplit(".", 1)[0]
-            zipf.writestr(f"{base}_pin.webp", pin)
+            pin = to_webp_bytes(r["raw_bytes"], PINTEREST_W, PINTEREST_H, quality)
+            base = r["filename"].rsplit(".", 1)[0]
+            z.writestr(f"{base}_pin.webp", pin)
+    if rows:
+        meta = pd.DataFrame([{
+            "keyword": r["keyword"],
+            "chosen_source": r["source"],
+            "license": r["license"],
+            "credit": r["credit"],
+            "credit_url": r["credit_url"],
+            "reference_only": r["reference_only"],
+        } for r in rows if not r["reference_only"]])
+        z.writestr("metadata.csv", meta.to_csv(index=False).encode("utf-8"))
+    z.close(); buf.seek(0)
+    return buf.getvalue()
 
-# ---------- Run ----------
+# ---------------- Run flow ----------------
 
-if run_btn:
-    keywords = [ln.strip() for ln in kw_text.splitlines() if ln.strip()]
-    if not keywords:
+if "phase" not in st.session_state:
+    st.session_state.phase = "idle"   # idle | picking | building
+
+if generate_btn:
+    kws = [ln.strip() for ln in kw_text.splitlines() if ln.strip()]
+    if not kws:
         st.warning("Please paste at least one keyword.")
         st.stop()
     if (use_places or use_street) and not google_key:
-        st.warning("Google Maps/Places API key is required for real photos (Places/Street View).")
+        st.warning("Google Maps/Places API key is required for real photos.")
         st.stop()
+    # expand LSI now
+    expanded = []
+    for kw in kws:
+        expanded.extend(lsi_expand(kw, imgs_per_kw))
+    st.session_state.keywords = expanded
+    st.session_state.phase = "picking"
+    st.experimental_rerun()
 
-    all_rows = []
-    meta_rows = []
-    zip_buf = io.BytesIO()
-    zipf = zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED)
-    progress = st.progress(0)
-    status = st.empty()
+if st.session_state.phase == "picking":
+    st.info("Step 1/2 — Pick one thumbnail per keyword (or leave 'Auto-best'), then click **Build images from my selections**.")
+    build_btn = st.button("Build images from my selections")
 
-    expanded_keywords = []
-    for kw in keywords:
-        expanded_keywords.extend(lsi_expand(kw, imgs_per_kw))
-
-    for idx, kw in enumerate(expanded_keywords, start=1):
-        status.info(f"Working {idx}/{len(expanded_keywords)}: {kw}")
+    for kw in st.session_state.get("keywords", []):
         cands = collect_candidates_for_query(kw)
-
-        with st.expander(f"📷 Thumbnails — choose one or leave 'Auto-best': {kw}", expanded=False):
-            picked_idx = None
-            if manual_pick == "Manual pick thumbnails" and cands:
+        with st.expander(f"📷 Thumbnails — {kw}", expanded=False):
+            if not cands:
+                st.caption("No real-photo candidates. If allowed, AI fallback will be used at build time.")
+            else:
                 cols = st.columns(3)
-                radios = []
                 for i, c in enumerate(cands):
                     with cols[i % 3]:
-                        # extra safety on display
                         try:
                             st.image(c.preview_bytes, use_container_width=True,
-                                     caption=f"{c.source} — {c.title}")
+                                     caption=f"[{i}] {c.source} — {c.title}")
                         except Exception:
-                            st.caption("(thumbnail could not render, skipped)")
-                            continue
-                        st.caption(f"License: {c.license}\n\nCredit: {c.credit}")
-                        pick = st.radio("Pick", [f"Use {i}", "Skip"], index=1, key=f"pick_{slugify(kw)}_{i}")
-                        radios.append((i, pick))
-                for i, val in radios:
-                    if val == f"Use {i}":
-                        picked_idx = i
-                        break
+                            st.caption(f"[{i}] (unrenderable bytes, skipped)")
+                        st.caption(f"License: {c.license}")
+                        st.caption(f"Credit: {c.credit}")
+            # single select per keyword
+            options = ["Auto-best"] + [f"Use {i}" for i in range(len(cands))]
+            st.selectbox("Your choice", options, key=f"choice_{slugify(kw)}")
 
-            if picked_idx is None:
-                picked_idx = choose_best(cands)
+    if build_btn:
+        st.session_state.phase = "building"
+        st.experimental_rerun()
 
-            if picked_idx is not None and 0 <= picked_idx < len(cands):
-                c = cands[picked_idx]
-                row = {
+if st.session_state.phase == "building":
+    all_rows = []
+    progress = st.progress(0)
+    for idx, kw in enumerate(st.session_state.get("keywords", []), start=1):
+        cands = collect_candidates_for_query(kw)
+        choice = st.session_state.get(f"choice_{slugify(kw)}", "Auto-best")
+        picked_idx = None
+        if choice.startswith("Use "):
+            try:
+                picked_idx = int(choice.split("Use ")[1])
+            except Exception:
+                picked_idx = None
+        if picked_idx is None:
+            picked_idx = choose_best(cands)
+
+        if picked_idx is not None and 0 <= picked_idx < len(cands):
+            c = cands[picked_idx]
+            all_rows.append({
+                "keyword": kw,
+                "source": c.source,
+                "license": c.license,
+                "credit": c.credit,
+                "credit_url": c.credit_url,
+                "reference_only": c.is_reference_only,
+                "raw_bytes": c.full_bytes,
+                "filename": f"{slugify(kw)}.webp"
+            })
+        else:
+            ai_img = ai_image_for(kw)
+            if ai_img:
+                all_rows.append({
                     "keyword": kw,
-                    "source": c.source,
-                    "license": c.license,
-                    "credit": c.credit,
-                    "credit_url": c.credit_url,
-                    "reference_only": c.is_reference_only,
-                    "raw_bytes": c.full_bytes,
+                    "source": f"OpenAI ({base_size})",
+                    "license": "OpenAI output",
+                    "credit": "Generated via OpenAI — no text/logos",
+                    "credit_url": None,
+                    "reference_only": False,
+                    "raw_bytes": ai_img,
                     "filename": f"{slugify(kw)}.webp"
-                }
-                all_rows.append(row)
-                meta_rows.append({
-                    "keyword": kw,
-                    "chosen_source": c.source,
-                    "license": c.license,
-                    "credit": c.credit,
-                    "credit_url": c.credit_url,
-                    "reference_only": c.is_reference_only
                 })
             else:
-                ai_img = ai_image_for(kw)
-                if ai_img:
-                    all_rows.append({
-                        "keyword": kw,
-                        "source": f"OpenAI ({base_size})",
-                        "license": "OpenAI output",
-                        "credit": "Generated via OpenAI — no text/logos",
-                        "credit_url": None,
-                        "reference_only": False,
-                        "raw_bytes": ai_img,
-                        "filename": f"{slugify(kw)}.webp"
-                    })
-                    meta_rows.append({
-                        "keyword": kw,
-                        "chosen_source": f"OpenAI ({base_size})",
-                        "license": "OpenAI output",
-                        "credit": "Generated via OpenAI — no text/logos",
-                        "credit_url": None,
-                        "reference_only": False
-                    })
-                else:
-                    st.warning(f"No usable photo for: **{kw}** (and AI fallback disabled/unavailable).")
+                st.warning(f"No usable photo for: **{kw}** (and AI fallback disabled/unavailable).")
+        progress.progress(idx / max(1, len(st.session_state.get("keywords", []))))
 
-        progress.progress(idx / len(expanded_keywords))
+    if all_rows:
+        zip_bytes = build_zip(all_rows, also_pinterest, quality)
+        st.success("Done! Download your bundle below.")
+        st.download_button("⬇️ Download ZIP", data=zip_bytes,
+                           file_name="imageforge_bundle.zip", mime="application/zip")
 
-    save_rows_to_zip(zipf, all_rows, also_pinterest, quality)
-    if meta_rows:
-        df = pd.DataFrame(meta_rows)
-        zipf.writestr("metadata.csv", df.to_csv(index=False).encode("utf-8"))
-    zipf.close()
-    zip_buf.seek(0)
+        st.markdown("### Previews & individual downloads")
+        cols = st.columns(3)
+        shown = 0
+        for r in all_rows:
+            if r["reference_only"]:
+                continue
+            try:
+                show_bytes = to_webp_bytes(r["raw_bytes"], TARGET_W, TARGET_H, quality)
+            except Exception:
+                continue
+            with cols[shown % 3]:
+                st.image(show_bytes, use_container_width=True, caption=r["filename"])
+                st.download_button("Download", data=show_bytes,
+                                   file_name=r["filename"], mime="image/webp")
+            shown += 1
 
-    st.success("Done! Download your bundle below.")
-    st.download_button("⬇️ Download ZIP", data=zip_buf, file_name="imageforge_bundle.zip", mime="application/zip")
+    # reset to idle so the next run starts fresh
+    st.session_state.phase = "idle"
 
-    st.markdown("### Previews & individual downloads")
-    cols = st.columns(3)
-    shown = 0
-    for i, row in enumerate(all_rows):
-        if row["reference_only"]:
-            continue
-        try:
-            show_bytes = to_webp_bytes(row["raw_bytes"], TARGET_W, TARGET_H, quality)
-        except Exception:
-            continue
-        with cols[shown % 3]:
-            st.image(show_bytes, use_container_width=True, caption=row["filename"])
-            st.download_button("Download", data=show_bytes, file_name=row["filename"], mime="image/webp")
-        shown += 1
-
-st.markdown(
-"""
+st.markdown("""
 **Notes**
-- Google Places & Street View have their own terms — use the credit in `metadata.csv`.
-- SerpAPI thumbnails are **reference-only** (never exported).
-- Openverse (CC) includes license and landing links in `metadata.csv`.
-- This build strictly validates bytes before any display or export to avoid image decoding errors.
-"""
-)
+- Manual pick is now a 2-step flow to ensure your selection is honored.
+- SerpAPI thumbnails are reference-only (never exported).
+- Openverse (CC) entries include license/credit in metadata.csv.
+- All images are byte-validated before display/export to avoid crashes.
+""")
