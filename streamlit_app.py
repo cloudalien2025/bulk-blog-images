@@ -1,4 +1,4 @@
-# ImageForge v0.9.4 — Bulk blog/Pinterest image generator with optional CC photo picker
+# ImageForge v0.9.5 — Bulk blog/Pinterest image generator with optional CC photo picker
 # Requirements: streamlit, requests, pillow
 # APIs: OpenAI (required), SerpAPI (optional). Openverse needs no key.
 
@@ -14,7 +14,7 @@ import streamlit as st
 # App config
 # ---------------------------
 APP_NAME = "ImageForge"
-APP_VERSION = "v0.9.4"
+APP_VERSION = "v0.9.5"
 DEFAULT_QUALITY = 82
 BLOG_W, BLOG_H = 1200, 675           # 16:9
 PIN_W, PIN_H  = 1000, 1500           # 2:3 (Pinterest standard pin)
@@ -73,6 +73,14 @@ def safe_download_image(url: str, timeout: int = 25) -> Optional[Image.Image]:
         return Image.open(io.BytesIO(r.content)).convert("RGB")
     except Exception:
         return None
+
+# Choose the best available URL in a candidate dict
+def best_url(d: dict) -> Optional[str]:
+    for k in ("original_url", "url", "image_url", "content_url", "thumbnail", "thumb_url"):
+        u = d.get(k)
+        if u:
+            return u
+    return None
 
 
 # ---------------------------
@@ -237,7 +245,7 @@ def openai_lsi(keyword: str, k: int, api_key: str) -> List[str]:
 
 
 # ---------------------------
-# Reference image search (SerpAPI + Openverse)
+# Reference image search (SerpAPI + Openverse) — patched
 # ---------------------------
 def serpapi_google_images(query: str, serp_key: str, num: int = 6, cc_only: bool = False) -> List[Dict]:
     if not serp_key:
@@ -247,23 +255,22 @@ def serpapi_google_images(query: str, serp_key: str, num: int = 6, cc_only: bool
         if cc_only:
             params["tbs"] = "sur:cl"  # CC filter
         r = requests.get("https://serpapi.com/search.json", params=params, timeout=60)
-        if r.status_code != 200:
-            return []
-        data = r.json()
-        results = []
-        for it in data.get("images_results", [])[:num]:
+        r.raise_for_status()
+        results: List[Dict] = []
+        for it in r.json().get("images_results", [])[:num]:
             results.append({
                 "thumb_url": it.get("thumbnail"),
-                "original_url": it.get("original"),
-                "title": it.get("title"),
-                "host": it.get("source"),
+                # fallbacks
+                "original_url": it.get("original") or it.get("link") or it.get("thumbnail"),
+                "title": it.get("title") or "",
+                "host": it.get("source") or it.get("domain") or "",
                 "owner_name": "",
                 "license": "CC (as reported by Google)" if cc_only else "Unspecified",
                 "license_url": "",
-                "attribution_url": it.get("link"),
+                "attribution_url": it.get("link") or "",
                 "source": "GoogleCC" if cc_only else "Google",
             })
-        return results
+        return [x for x in results if best_url(x)]
     except Exception:
         return []
 
@@ -271,37 +278,36 @@ def openverse_search(query: str, num: int = 6) -> List[Dict]:
     try:
         r = requests.get(
             "https://api.openverse.engineering/v1/images/",
-            params={"q":query, "page_size":num},
+            params={"q": query, "page_size": num},
             timeout=60
         )
-        if r.status_code != 200:
-            return []
-        out = []
+        r.raise_for_status()
+        out: List[Dict] = []
         for item in r.json().get("results", [])[:num]:
             out.append({
-                "thumb_url": item.get("thumbnail"),
-                "original_url": item.get("url"),
-                "title": item.get("title"),
-                "owner_name": item.get("creator"),
-                "license": item.get("license"),
-                "license_url": item.get("license_url"),
-                "attribution_url": item.get("foreign_landing_url"),
+                "thumb_url": item.get("thumbnail") or item.get("url"),
+                "original_url": item.get("url") or item.get("thumbnail"),
+                "title": item.get("title") or "",
+                "owner_name": item.get("creator") or "",
+                "license": item.get("license") or "",
+                "license_url": item.get("license_url") or "",
+                "attribution_url": item.get("foreign_landing_url") or item.get("detail_url") or "",
                 "source": "Openverse",
             })
-        return out
+        return [x for x in out if best_url(x)]
     except Exception:
         return []
 
 def aggregate_cc_candidates(keyword: str, site: str, want_sources: List[str], serp_key: str, num: int) -> List[Dict]:
     q = f"{keyword} {site.split('.')[0].replace('-', ' ')}"
-    results = []
+    results: List[Dict] = []
     if "Google (via SerpAPI)" in want_sources:
         results += serpapi_google_images(q, serp_key, num=num, cc_only=True)
     if "Openverse" in want_sources:
         results += openverse_search(q, num=num)
     dedup = {}
     for r in results:
-        url = r.get("original_url")
+        url = best_url(r)
         if url and (url not in dedup):
             dedup[url] = r
     return list(dedup.values())[:num]
@@ -402,7 +408,7 @@ if run_btn:
                     cols = st.columns(min(4, len(cands)))
                     for i, c in enumerate(cands):
                         with cols[i % 4]:
-                            st.image(c.get("thumb_url") or c.get("original_url"), use_container_width=True)
+                            st.image(c.get("thumb_url") or best_url(c), use_container_width=True)
                             st.caption(f"{c.get('source','')} — {c.get('title','')[:40]}")
                     pick = st.selectbox(
                         "Pick a CC photo (or choose AI render):",
@@ -414,7 +420,8 @@ if run_btn:
         st.write("---")
 
     def save_cc(cand: Dict, fname_base: str) -> Optional[Tuple[bytes, str]]:
-        img = safe_download_image(cand.get("original_url", ""))
+        u = best_url(cand)
+        img = safe_download_image(u)
         if not img:
             return None
         webp_local = to_webp_bytes(img, OUT_W, OUT_H, quality)
@@ -426,7 +433,7 @@ if run_btn:
             )
         else:  # GoogleCC
             line = (
-                f"{fname_base} — Google Images (CC as reported): {cand.get('original_url','')} | "
+                f"{fname_base} — Google Images (CC as reported): {best_url(cand) or ''} | "
                 f"Title: {cand.get('title','')} | Source: {cand.get('host','')}"
             )
         return webp_local, line
