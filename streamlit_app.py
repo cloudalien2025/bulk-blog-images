@@ -1,496 +1,375 @@
-# ImageForge v0.8.1 — Explorer (Hotfix)
-# SerpAPI + LSI + Reference-Lock; fixes OpenAI 400 (response_format) and NameError on fallback.
+# ImageForge – Real-Photo Mode v1.0
+# Streamlit app for real photos of venues/places; AI is not used here.
+# Sources: Google Places Photos, Google Street View Static, Openverse (CC).
+# Exports: 1200x675 (WebP), optional Pinterest 1000x1500, plus metadata.csv.
 
-import os, io, re, time, base64, zipfile, json, random
-from typing import List, Dict, Optional, Tuple
-
+import io
+import os
+import re
+import csv
+import time
+import math
+import html
+import json
+import base64
+import zipfile
+import textwrap
 import requests
-from PIL import Image, ImageStat
 import streamlit as st
+from typing import List, Dict, Any, Tuple, Optional
+from PIL import Image
 
-APP_TITLE = "ImageForge v0.8.1 — Explorer (Hotfix)"
+# ------------------------- UI SETTINGS -------------------------
+st.set_page_config(page_title="ImageForge – Real-Photo Mode", layout="wide")
 
-# ---------- OUTPUT SIZES ----------
-DEFAULT_OUTPUT_W, DEFAULT_OUTPUT_H = 1200, 675
-PIN_OUTPUT_W, PIN_OUTPUT_H = 1000, 1500
-OPENAI_SIZES = ["1536x1024", "1024x1536", "1024x1024"]
+TITLE = "ImageForge v1.0 — Real-Photo Mode"
+st.title(TITLE)
+st.caption(
+    "Real photos first: Google Places Photos → Street View → Openverse (CC). "
+    "Lock a specific thumbnail to ‘reference-lock’ it. Exports WebP + metadata.csv."
+)
 
-# ---------- SITE PROFILES ----------
-SITE_PROFILES = {
-    "vailvacay.com":  "Colorado Rockies resort/village, alpine architecture, fir/spruce, riverside paths, ski terrain; photoreal; editorial stock feel; no text/logos.",
-    "bostonvacay.com":"Historic New England city, brick & brownstone, harbor/waterfront, parks; photoreal; editorial stock feel; no text/logos.",
-    "bangkokvacay.com":"Southeast Asian metropolis, street food/night markets, temples/rooftops/skyline; photoreal; editorial stock feel; no text/logos.",
-    "ipetzo.com":      "Pet lifestyle scenes, owners with dogs/cats in parks/neutral interiors; photoreal; editorial stock feel; no brands/text.",
-    "1-800deals.com":  "Generic shopping/ecommerce scenes, parcels, aisles; clean backgrounds; photoreal; no brands/text."
-}
-DEFAULT_SITE = "vailvacay.com"
-
-# ---------- UTILS ----------
+# ------------------------- HELPERS -------------------------
 def slugify(text: str) -> str:
     t = text.lower().strip()
     t = re.sub(r"[’'`]", "", t)
     t = re.sub(r"[^a-z0-9]+", "-", t).strip("-")
-    return t or "image"
+    return t
 
 def crop_to_aspect(img: Image.Image, target_w: int, target_h: int) -> Image.Image:
     target_ratio = target_w / target_h
     w, h = img.size
     cur_ratio = w / h
     if cur_ratio > target_ratio:
-        new_w = int(h * target_ratio); left = (w - new_w) // 2
-        return img.crop((left, 0, left + new_w, h))
+        new_w = int(h * target_ratio)
+        left = (w - new_w) // 2
+        box = (left, 0, left + new_w, h)
     else:
-        new_h = int(w / target_ratio); top = (h - new_h) // 2
-        return img.crop((0, top, w, top + new_h))
+        new_h = int(w / target_ratio)
+        top = (h - new_h) // 2
+        box = (0, top, w, top + new_h)
+    return img.crop(box)
 
-def save_webp_bytes(img: Image.Image, w: int, h: int, q: int) -> bytes:
-    img = img.convert("RGB")
+def to_webp_bytes(img_bytes: bytes, w: int, h: int, quality: int) -> bytes:
+    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
     img = crop_to_aspect(img, w, h).resize((w, h), Image.LANCZOS)
-    buf = io.BytesIO(); img.save(buf, "WEBP", quality=q, method=6)
+    buf = io.BytesIO()
+    img.save(buf, "WEBP", quality=quality, method=6)
     return buf.getvalue()
 
-def fetch_image_bytes(url: str, timeout: int = 25) -> Optional[bytes]:
+def strip_html_attrib(html_str: str) -> Tuple[str, Optional[str]]:
+    # Google Photos returns html attributions like: <a href="...">Name</a>
+    url_match = re.search(r'href="([^"]+)"', html_str or "")
+    name = re.sub(r"<[^>]+>", "", html_str or "").strip()
+    return name, (url_match.group(1) if url_match else None)
+
+def safe_get(url: str, **kwargs) -> Optional[requests.Response]:
     try:
-        r = requests.get(url, timeout=timeout, headers={"User-Agent":"Mozilla/5.0"})
-        if r.status_code == 200 and r.content:
-            return r.content
-    except Exception:
-        pass
-    return None
+        return requests.get(url, timeout=30, **kwargs)
+    except requests.RequestException:
+        return None
 
-def luminance_fraction(img: Image.Image, lo: int = 220) -> float:
-    g = img.convert("L"); hist = g.histogram()
-    total = sum(hist); white = sum(hist[lo:])
-    return (white/total) if total else 0.0
+# ------------------------- API CALLS -------------------------
+def google_places_text_search(query: str, key: str, region: Optional[str]=None) -> List[Dict[str,Any]]:
+    base = "https://maps.googleapis.com/maps/api/place/textsearch/json"
+    params = {"query": query, "key": key}
+    if region:
+        params["region"] = region
+    r = safe_get(base, params=params)
+    if not r or r.status_code != 200:
+        return []
+    data = r.json()
+    return data.get("results", [])
 
-def color_presence(img: Image.Image, hue_range: Tuple[int,int], sat_lo=80, val_lo=70) -> float:
-    import colorsys
-    img = img.convert("RGB").resize((256,256))
-    w,h = img.size; count=0; hit=0; h1,h2 = hue_range; wrap = h2 < h1
-    for y in range(h):
-        for x in range(w):
-            r,g,b = img.getpixel((x,y)); r/=255; g/=255; b/=255
-            H,S,V = colorsys.rgb_to_hsv(r,g,b)
-            Hdeg, S100, V100 = int(H*360), int(S*100), int(V*100)
-            count += 1
-            cond_h = (Hdeg>=h1 or Hdeg<=h2) if wrap else (h1<=Hdeg<=h2)
-            if cond_h and S100>=sat_lo and V100>=val_lo: hit += 1
-    return hit/max(1,count)
+def google_place_details(place_id: str, key: str) -> Dict[str,Any]:
+    base = "https://maps.googleapis.com/maps/api/place/details/json"
+    fields = "name,formatted_address,geometry,photo,editorial_summary,url,website"
+    params = {"place_id": place_id, "fields": fields, "key": key}
+    r = safe_get(base, params=params)
+    if not r or r.status_code != 200:
+        return {}
+    return r.json().get("result", {})
 
-def analyze_reference(url: str) -> Dict:
-    data = fetch_image_bytes(url)
-    if not data: return {"ok": False}
-    try:
-        img = Image.open(io.BytesIO(data)).convert("RGB")
-    except Exception:
-        return {"ok": False}
+def google_photo_bytes(photo_ref: str, key: str, max_width: int=1600) -> Optional[bytes]:
+    # Google redirects to the actual image URL; requests follows by default.
+    base = "https://maps.googleapis.com/maps/api/place/photo"
+    r = safe_get(base, params={"maxwidth": max_width, "photo_reference": photo_ref, "key": key}, allow_redirects=True)
+    if not r or r.status_code != 200:
+        return None
+    return r.content
 
-    snow_frac = luminance_fraction(img, lo=225)
-    yellow_frac = color_presence(img, (35,60), 70, 65)
-    blue_frac = color_presence(img, (195,240), 40, 55)
-    stat = ImageStat.Stat(img); mean = stat.mean
-    warm_hint = (mean[0] > mean[2])
+def google_street_view_bytes(lat: float, lng: float, key: str, size: str="640x640") -> Optional[bytes]:
+    # Standard plan has 640px max. We upscale later. Watermark must remain.
+    base = "https://maps.googleapis.com/maps/api/streetview"
+    params = {"size": size, "location": f"{lat},{lng}", "key": key}
+    r = safe_get(base, params=params)
+    if not r or r.status_code != 200:
+        return None
+    return r.content
 
-    checklist = set()
-    if snow_frac >= 0.06: checklist.add("snow_on_ground_and_roofs")
-    if yellow_frac >= 0.015: checklist.add("patio_umbrellas_or_warm_yellow_accents")
-    checklist.add("alpine_gabled_facade_with_balconies")
-    if blue_frac >= 0.04: checklist.add("visible_sky_background")
-
-    return {"ok": True, "snow_frac": snow_frac, "yellow_frac": yellow_frac,
-            "blue_frac": blue_frac, "warm_hint": warm_hint, "checklist": list(checklist)}
-
-def expectation_from_features(feat: Dict) -> Dict:
-    return {
-        "expect_snow": "snow_on_ground_and_roofs" in feat.get("checklist", []),
-        "expect_yellow": "patio_umbrellas_or_warm_yellow_accents" in feat.get("checklist", [])
-    }
-
-def postcheck(img_bytes: bytes, expect: Dict) -> bool:
-    try:
-        img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-    except Exception:
-        return False
-    ok = True
-    if expect.get("expect_snow") and luminance_fraction(img, lo=225) < 0.04: ok = False
-    if expect.get("expect_yellow") and color_presence(img, (35,60), 70,65) < 0.008: ok = False
-    return ok
-
-# ---------- SEARCH SOURCES ----------
-def openverse_search(q: str, n: int = 4) -> List[Dict]:
+def openverse_search(query: str, per_page: int=6) -> List[Dict[str,Any]]:
     url = "https://api.openverse.engineering/v1/images/"
-    params = {"q": q, "license": "cc0,cc-by,cc-by-sa,cc-by-nd", "page_size": min(10, max(1, n))}
-    try:
-        r = requests.get(url, params=params, timeout=20)
-        out = []
-        if r.status_code == 200:
-            for it in r.json().get("results", []):
-                link = it.get("url") or it.get("foreign_landing_url")
-                thumb = it.get("thumbnail") or link
-                if link:
-                    out.append({"title": it.get("title") or "", "url": link,
-                                "thumb": thumb, "source":"Openverse (CC)",
-                                "license": it.get("license") or "cc", "is_cc": True})
-                if len(out) >= n: break
-        return out
-    except Exception:
+    params = {
+        "q": query,
+        "page_size": per_page,
+        "license": "cc0,by,by-sa",  # permissive licenses
+        "license_type": "all",      # include commercial if available
+        "mature": "false",
+        "format": "json",
+    }
+    r = safe_get(url, params=params)
+    if not r or r.status_code != 200:
         return []
+    data = r.json()
+    return data.get("results", [])
 
-def google_cse_images(q: str, api_key: str, cx: str, n: int = 4) -> List[Dict]:
-    if not api_key or not cx: return []
-    url = "https://www.googleapis.com/customsearch/v1"
-    params = {"key": api_key, "cx": cx, "q": q, "searchType":"image",
-              "num": min(10, max(1,n)), "safe":"active", "imgSize":"large"}
-    try:
-        r = requests.get(url, params=params, timeout=20)
-        out = []
-        if r.status_code == 200:
-            for it in r.json().get("items", []):
-                link = it.get("link")
-                thumb = (it.get("image") or {}).get("thumbnailLink") or link
-                if link:
-                    out.append({"title": it.get("title") or "", "url": link,
-                                "thumb": thumb, "source":"Google (non-CC)",
-                                "license":"reference-only", "is_cc": False})
-                if len(out) >= n: break
-        return out
-    except Exception:
-        return []
-
-def serpapi_images(q: str, serp_key: str, n: int = 4) -> List[Dict]:
-    if not serp_key: return []
-    url = "https://serpapi.com/search.json"
-    params = {"engine":"google", "q": q, "tbm":"isch", "ijn":"0",
-              "api_key": serp_key, "num": min(10, max(1,n))}
-    try:
-        r = requests.get(url, params=params, timeout=20)
-        out = []
-        if r.status_code == 200:
-            for it in r.json().get("images_results", []):
-                link = it.get("original") or it.get("thumbnail") or it.get("source")
-                thumb = it.get("thumbnail") or link
-                if link:
-                    out.append({"title": it.get("title") or "", "url": link,
-                                "thumb": thumb, "source":"SerpAPI (Google Images, non-CC)",
-                                "license":"reference-only", "is_cc": False})
-                if len(out) >= n: break
-        return out
-    except Exception:
-        return []
-
-# ---------- PROMPTS ----------
-def venue_mode_hint(keyword: str) -> bool:
-    k = keyword.lower()
-    return any(x in k for x in ["restaurant","bar","cafe","coffee","hotel","inn","lodge","tavern","rooftop","resort"])
-
-def detect_season_from_keyword(keyword: str) -> Optional[str]:
-    k = keyword.lower()
-    tags = [("january","winter"),("february","winter"),("march","late winter"),
-            ("april","spring shoulder"),("may","spring"),("june","summer"),
-            ("july","summer"),("august","summer"),("september","early fall"),
-            ("october","fall"),("november","late fall"),("december","winter"),
-            ("christmas","winter"),("snow","winter"),("ski","winter"),("back bowls","winter")]
-    for name,tag in tags:
-        if name in k: return tag
-    return None
-
-def build_prompt(site: str, keyword: str, season_mode: str,
-                 ref_feat: Optional[Dict], fidelity: int,
-                 lock_strength: str, venue: bool) -> str:
-    base = SITE_PROFILES.get(site, SITE_PROFILES[DEFAULT_SITE])
-    # season
-    season_hint = ""
-    if season_mode == "Auto":
-        s = detect_season_from_keyword(keyword) or ""
-        season_hint = f"Season cues: {s}. " if s else ""
-    elif season_mode in ("Winter","Summer","Fall","Spring"):
-        season_hint = f"Season cues: {season_mode}. "
-
-    constraints = []
-    if ref_feat and ref_feat.get("ok"):
-        cl = set(ref_feat.get("checklist", []))
-        names = {
-            "alpine_gabled_facade_with_balconies":"alpine gabled façade with balconies",
-            "snow_on_ground_and_roofs":"fresh snow on ground and roofs",
-            "patio_umbrellas_or_warm_yellow_accents":"patio with umbrellas and warm yellow accents",
-            "visible_sky_background":"sky and mountain backdrop",
-        }
-        for key in ["alpine_gabled_facade_with_balconies","snow_on_ground_and_roofs",
-                    "patio_umbrellas_or_warm_yellow_accents","visible_sky_background"]:
-            if key in cl: constraints.append(names[key])
-
-    lock_phrase = ""
-    if lock_strength == "Strong" and constraints:
-        lock_phrase = " The scene must clearly include: " + ", ".join(constraints) + "."
-    elif lock_strength == "Moderate" and constraints:
-        lock_phrase = " The scene should include: " + ", ".join(constraints) + "."
-
-    venue_bits = ""
-    if venue:
-        venue_bits = (" Exterior, eye-level view of the venue façade and patio seating if present; "
-                      "warm window glow or string lights at dusk is welcome; "
-                      "do not show readable signage or logos; keep everything generic.")
-
-    strict = ""
-    if fidelity >= 80:
-        strict = (" Balanced yet tight composition mirroring the reference layout. "
-                  "Prominent, unambiguous depiction of the listed elements.")
-    elif fidelity >= 50:
-        strict = " Keep composition similar to the reference vibe and include the listed elements."
-    else:
-        strict = " General vibe match is sufficient."
-
-    return (f"{base} {season_hint}"
-            f"Create a photorealistic, editorial-style stock image for: '{keyword}'. "
-            f"Landscape orientation. No words, watermarks, trademarks, or readable storefront text. "
-            f"{venue_bits}{lock_phrase}{strict}")
-
-# ---------- OPENAI ----------
-def dalle_generate_image_bytes(prompt: str, size: str, api_key: str) -> bytes:
+# ------------------------- CANDIDATE GATHERING -------------------------
+def build_candidates_for_keyword(
+    kw: str,
+    google_key: Optional[str],
+    use_places: bool,
+    use_streetview: bool,
+    use_openverse: bool,
+    max_place_results: int,
+    max_images_per_kw: int,
+) -> List[Dict[str,Any]]:
     """
-    Robust: no 'response_format' sent. If API returns b64_json we decode, else we fetch from 'url'.
+    Returns a list of candidates:
+    {
+      'preview_bytes': bytes,
+      'full_bytes': bytes,  # same for us
+      'source': 'Google Places' | 'Street View' | 'Openverse',
+      'title': 'Blue Moose Pizza (Google Places)',
+      'credit': 'Photo: Name via Google',
+      'license': 'Google Places Terms' | 'CC BY 4.0' | 'CC0' | ...
+      'credit_url': 'https://...'
+    }
     """
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    payload = {"model":"gpt-image-1", "prompt": prompt, "size": size}
-    r = requests.post("https://api.openai.com/v1/images/generations",
-                      headers=headers, json=payload, timeout=120)
-    if r.status_code != 200:
-        raise RuntimeError(f"OpenAI error {r.status_code}: {r.text}")
-    data = r.json().get("data", [{}])[0]
-    if "b64_json" in data:
-        return base64.b64decode(data["b64_json"])
-    if "url" in data:
-        bytes_ = fetch_image_bytes(data["url"])
-        if not bytes_:
-            raise RuntimeError("Failed to download image from returned URL.")
-        return bytes_
-    raise RuntimeError("OpenAI response missing image data.")
+    candidates: List[Dict[str,Any]] = []
 
-def openai_lsi_terms(keyword: str, k: int, api_key: str) -> List[str]:
-    try:
-        url = "https://api.openai.com/v1/chat/completions"
-        headers = {"Authorization": f"Bearer {api_key}", "Content-Type":"application/json"}
-        sys = ("You generate SEO LSI ideas. Return a plain list with one short phrase per line, "
-               "no numbering, no quotes.")
-        user = f"Main keyword: {keyword}\nReturn {k} closely-related subtopics suitable for distinct images."
-        body = {"model":"gpt-4o-mini", "messages":[{"role":"system","content":sys},
-                                                   {"role":"user","content":user}],
-                "temperature":0.5}
-        r = requests.post(url, headers=headers, json=body, timeout=60)
-        if r.status_code != 200: return []
-        txt = r.json()["choices"][0]["message"]["content"]
-        lines = [ln.strip(" -•\t") for ln in txt.splitlines() if ln.strip()]
-        uniq = []
-        for ln in lines:
-            if ln.lower() not in [x.lower() for x in uniq]:
-                uniq.append(ln)
-            if len(uniq) >= k: break
-        return uniq[:k]
-    except Exception:
-        return []
+    # 1) Google Places Photos
+    if google_key and use_places:
+        results = google_places_text_search(kw, google_key)[:max_place_results]
+        for res in results:
+            pid = res.get("place_id")
+            det = google_place_details(pid, google_key) if pid else {}
+            photos = det.get("photos", []) if det else []
+            name = det.get("name") or res.get("name") or kw
+            address = det.get("formatted_address") or ""
+            lat = det.get("geometry", {}).get("location", {}).get("lat")
+            lng = det.get("geometry", {}).get("location", {}).get("lng")
 
-def heuristic_lsi(keyword: str, k: int) -> List[str]:
-    k = max(0,k)
-    out = []
-    klow = keyword.lower()
-    loc = ""
-    m = re.search(r"in ([a-z ,\-]+)$", klow) or re.search(r"in ([a-z ,\-]+)\b", klow)
-    if m: loc = m.group(1).strip(", ").title()
-    buckets = ["best photo spots", "scenic viewpoint", "cozy cafés", "family-friendly activity",
-               "hidden gem", "budget-friendly idea", "romantic spot", "day trip", "local market",
-               "popular hike", "waterfront walk", "museum/gallery", "night view", "sunrise/sunset spot"]
-    random.shuffle(buckets)
-    for b in buckets:
-        item = f"{b} {('in ' + loc) if loc else ''}".strip()
-        if item.lower() != keyword.lower():
-            out.append(item)
-        if len(out) >= k: break
-    return out[:k]
+            # Photos first
+            for ph in photos:
+                if len(candidates) >= max_images_per_kw:
+                    break
+                ref = ph.get("photo_reference")
+                if not ref:
+                    continue
+                img_bytes = google_photo_bytes(ref, google_key)
+                if not img_bytes:
+                    continue
+                atts = ph.get("html_attributions", [])
+                credit_name, credit_url = strip_html_attrib(atts[0]) if atts else ("Google contributor", None)
+                candidates.append({
+                    "preview_bytes": img_bytes,
+                    "full_bytes": img_bytes,
+                    "source": "Google Places",
+                    "title": f"{name} (Google Places)",
+                    "credit": f"Photo: {credit_name} via Google",
+                    "license": "Google Maps Platform Terms",
+                    "credit_url": credit_url,
+                })
 
-# ---------- UI ----------
-st.set_page_config(page_title=APP_TITLE, layout="wide")
-st.title(APP_TITLE)
+            # If no photos and Street View is allowed, add 1 Street View fallback
+            if use_streetview and len(candidates) < max_images_per_kw and lat and lng:
+                sv_bytes = google_street_view_bytes(lat, lng, google_key)
+                if sv_bytes:
+                    candidates.append({
+                        "preview_bytes": sv_bytes,
+                        "full_bytes": sv_bytes,
+                        "source": "Street View",
+                        "title": f"{name} (Street View)",
+                        "credit": "Image © Google Street View (watermark must remain).",
+                        "license": "Street View Terms",
+                        "credit_url": None,
+                    })
 
+            if len(candidates) >= max_images_per_kw:
+                break
+
+    # 2) Openverse CC
+    if use_openverse and len(candidates) < max_images_per_kw:
+        ov = openverse_search(kw, per_page=max_images_per_kw * 2)
+        for item in ov:
+            if len(candidates) >= max_images_per_kw:
+                break
+            img_url = item.get("url") or item.get("thumbnail")
+            if not img_url:
+                continue
+            r = safe_get(img_url)
+            if not r or r.status_code != 200:
+                continue
+            creator = item.get("creator") or "Unknown"
+            license_ = (item.get("license") or "").upper()
+            source_url = item.get("foreign_landing_url") or item.get("url")
+            title = item.get("title") or kw
+            candidates.append({
+                "preview_bytes": r.content,
+                "full_bytes": r.content,
+                "source": "Openverse",
+                "title": f"{title} (Openverse)",
+                "credit": f"Photo: {creator} via Openverse",
+                "license": f"CC {license_}" if license_ else "CC (see source)",
+                "credit_url": source_url,
+            })
+
+    return candidates
+
+# ------------------------- UI: SIDEBAR -------------------------
 with st.sidebar:
     st.subheader("Keys")
-    openai_key = st.text_input("OpenAI API key", type="password")
-    g_key = st.text_input("Google CSE API key (for thumbnails, optional)", type="password")
-    g_cx  = st.text_input("Google CSE CX (engine id, optional)", type="password")
-    serp_key = st.text_input("SerpAPI key (optional)", type="password")
+    GOOGLE_KEY = st.text_input("Google Maps/Places API key (required for real photos)", type="password")
+    st.caption("Enable Places API + Street View Static API in your Google Cloud project.")
 
     st.subheader("Output")
-    site = st.selectbox("Site style", list(SITE_PROFILES.keys()),
-                        index=list(SITE_PROFILES.keys()).index(DEFAULT_SITE))
-    render_size = st.selectbox("Render base size", OPENAI_SIZES, index=0)
-    webp_quality = st.slider("WebP quality", 60, 95, 82)
-    make_pins = st.checkbox("Also make a Pinterest image (1000×1500)", value=False)
+    WEBP_W, WEBP_H = 1200, 675
+    base_size = st.selectbox("Render base size (source fetch/crop target)", ["1536x1024", "1024x1024", "1024x1536"], index=0)
+    quality = st.slider("WebP quality", 60, 95, 82)
 
-    st.subheader("Thumbnail sources")
-    use_openverse = st.checkbox("Openverse (CC)", value=True)
-    use_cse = st.checkbox("Google CSE (non-CC reference)", value=True)
-    use_serp = st.checkbox("SerpAPI (Google Images, non-CC reference)", value=True)
-    prefer_cc = st.checkbox("CC-first", value=True)
-    allow_noncc = st.checkbox("Allow non-CC reference if no CC found", value=True)
-    cand_per_kw = st.slider("Candidates per keyword", 2, 8, 4)
+    make_pin = st.checkbox("Also make a Pinterest image (1000×1500)", value=False)
 
-    st.subheader("Reference Lock & Season")
-    lock_strength = st.selectbox("Reference Lock", ["Strong","Moderate","Off"], index=0)
-    fidelity = st.slider("Fidelity (strictness & retries)", 0, 100, 70)
-    season_mode = st.selectbox("Season cues", ["Auto","Winter","Summer","Fall","Spring"])
+    st.subheader("Sources")
+    use_places = st.checkbox("Google Places Photos", value=True)
+    use_streetview = st.checkbox("Street View fallback", value=True)
+    use_openverse = st.checkbox("Openverse (CC only)", value=True)
 
-    st.subheader("LSI expansion")
-    lsi_mode = st.selectbox("LSI method", ["Off","Heuristic","OpenAI"], index=0)
-    images_per_kw = st.slider("Images per keyword (with LSI)", 1, 10, 1)
+    st.subheader("Preferences")
+    manual_pick = st.selectbox("Thumbnail picking", ["Auto-pick first", "Manual pick (choose below)"], index=1)
+    max_place_results = st.slider("Max place results to inspect", 1, 5, 3)
+    candidates_per_kw = st.slider("Max candidates per keyword", 1, 8, 4)
 
-st.caption("Paste keywords (one per line).")
-keywords_text = st.text_area("Keywords", height=180,
-    placeholder="Tavern on the Square, Vail Colorado\nBest seafood restaurant in Boston\nThings to do in Vail in October")
+st.markdown("### Paste keywords (one per line)")
+kw_text = st.text_area(
+    "Keywords",
+    height=160,
+    placeholder="Tavern on the Square, Vail Colorado\nBest seafood restaurant in Boston\nThings to do in Vail in October",
+    label_visibility="collapsed"
+)
+keywords = [ln.strip() for ln in kw_text.splitlines() if ln.strip()]
 
 colA, colB = st.columns([1,1])
-generate_btn = colA.button("Generate", type="primary")
-if colB.button("Clear"): st.session_state.clear(); st.experimental_rerun()
+go = colA.button("Generate")
+clear = colB.button("Clear")
+if clear:
+    st.experimental_rerun()
 
-# ---------- THUMBNAIL FLOW ----------
-def collect_thumbnails(q: str, n: int) -> List[Dict]:
-    items: List[Dict] = []
-    if prefer_cc and use_openverse:
-        items.extend(openverse_search(q, n))
-    if allow_noncc:
-        still = n - len(items)
-        if still > 0 and use_cse:
-            items.extend(google_cse_images(q, g_key, g_cx, still))
-        still = n - len(items)
-        if still > 0 and use_serp:
-            items.extend(serpapi_images(q, serp_key, still))
-    return items[:n]
-
-def autopick_thumb(items: List[Dict]) -> Optional[Dict]:
-    if not items: return None
-    for it in items:
-        if it.get("is_cc"): return it
-    return items[0]
-
-def show_thumb_picker(q: str, items: List[Dict]) -> Optional[Dict]:
-    if not items:
-        st.info("No candidates found. It will render with AI only.")
-        return None
-    pick = None
-    for i, it in enumerate(items):
-        c1,c2 = st.columns([3,5])
-        with c1: st.image(it.get("thumb") or it["url"], use_container_width=True)
-        with c2:
-            st.write(f"**{it.get('title') or 'Untitled'}**")
-            st.caption(f"Source: {it['source']} — license: {it['license']}")
-            if st.button(f"Use this as reference (#{i+1})", key=f"use_{slugify(q)}_{i}"):
-                pick = it
-    return pick
-
-# ---------- RUN ----------
-if generate_btn:
-    if not openai_key:
-        st.warning("Please enter your OpenAI API key."); st.stop()
-    keywords = [ln.strip() for ln in keywords_text.splitlines() if ln.strip()]
+# ------------------------- MAIN FLOW -------------------------
+if go:
+    if not GOOGLE_KEY:
+        st.error("Please add your **Google Places API key** in the sidebar.")
+        st.stop()
     if not keywords:
-        st.warning("Please paste at least one keyword."); st.stop()
+        st.warning("Please paste at least one keyword.")
+        st.stop()
 
-    def expand_keywords(main_kw: str) -> List[str]:
-        if images_per_kw <= 1 or lsi_mode == "Off":
-            return [main_kw]
-        needed = images_per_kw - 1
-        extras: List[str] = []
-        if lsi_mode == "OpenAI":
-            extras = openai_lsi_terms(main_kw, needed, openai_key)
-        if not extras and lsi_mode in ("Heuristic","OpenAI"):
-            extras = heuristic_lsi(main_kw, needed)
-        return [main_kw] + extras[:needed]
-
-    zip_buf = io.BytesIO()
-    zf = zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED)
-    gallery = []
-
-    progress = st.progress(0)
-    status = st.empty()
-
+    st.info("Collecting real-photo candidates. This can take a moment…")
+    all_candidates: Dict[str, List[Dict[str,Any]]] = {}
+    progress = st.progress(0.0)
     for i, kw in enumerate(keywords, start=1):
-        status.info(f"Working {i}/{len(keywords)}: {kw}")
-        all_subkws = expand_keywords(kw)
+        cands = build_candidates_for_keyword(
+            kw=kw,
+            google_key=GOOGLE_KEY,
+            use_places=use_places,
+            use_streetview=use_streetview,
+            use_openverse=use_openverse,
+            max_place_results=max_place_results,
+            max_images_per_kw=candidates_per_kw
+        )
+        all_candidates[kw] = cands
+        progress.progress(i / len(keywords))
 
-        for j, active_kw in enumerate(all_subkws, start=1):
-            venue = venue_mode_hint(active_kw)
-            items = collect_thumbnails(active_kw, cand_per_kw)
-            with st.expander(f"📷 Thumbnails — choose one or leave 'AI render': {active_kw}", expanded=False):
-                picked = show_thumb_picker(active_kw, items)
-            if not picked:
-                picked = autopick_thumb(items)
+    st.success("Candidates collected. Review & lock selections (or leave as auto).")
 
-            ref_feat = None; expect = {}
-            if picked:
-                st.caption(f"Using reference: {picked.get('title') or picked['source']} ({picked['source']})")
-                feat = analyze_reference(picked["url"])
-                if feat.get("ok"):
-                    ref_feat = feat; expect = expectation_from_features(feat)
+    # SELECTION UI
+    selections: Dict[str, int] = {}
+    for kw in keywords:
+        cands = all_candidates.get(kw, [])
+        with st.expander(f"📷 Thumbnails — choose one or leave 'Auto': {kw}", expanded=True):
+            if not cands:
+                st.warning("No candidates found (even after fallbacks). Try rephrasing the keyword.")
+                selections[kw] = -1
+            else:
+                # Show grid
+                n = len(cands)
+                cols = st.columns(min(4, n))
+                for idx, cand in enumerate(cands):
+                    with cols[idx % min(4, n)]:
+                        st.image(cand["preview_bytes"], use_container_width=True, caption=f"{idx+1}. {cand['title']}")
+                        st.caption(f"{cand['credit']} — {cand['license']}")
+                default_label = "Auto (pick 1st)"
+                options = [default_label] + [f"Use #{i+1}" for i in range(n)]
+                choice = st.selectbox("Selection", options, key=f"sel_{slugify(kw)}")
+                selections[kw] = -1 if choice == default_label else (int(choice.split("#")[1]) - 1)
 
-            lock = lock_strength if ref_feat else "Off"
-            prompt = build_prompt(site, active_kw, season_mode, ref_feat, fidelity, lock, venue)
+    # FINALIZE
+    st.markdown("---")
+    finalize = st.button("Create images & ZIP")
+    if finalize:
+        zip_buf = io.BytesIO()
+        zf = zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED)
+        meta_rows = [("filename", "keyword", "source", "title", "credit", "license", "credit_url")]
 
-            tries_per_img = 1 + (fidelity // 40)
-            ok_img: Optional[bytes] = None
-            last_bytes: Optional[bytes] = None
-            local_prompt = prompt
-
-            for _t in range(tries_per_img):
-                img_bytes = None
-                try:
-                    img_bytes = dalle_generate_image_bytes(local_prompt, render_size, openai_key)
-                except Exception as e:
-                    st.error(f"{active_kw}: OpenAI error — {e}")
-                    break
-                last_bytes = img_bytes
-                if ref_feat and lock != "Off":
-                    if postcheck(img_bytes, expect):
-                        ok_img = img_bytes; break
-                    else:
-                        local_prompt += " The required elements must be clearly visible."
-                else:
-                    ok_img = img_bytes; break
-
-            if ok_img is None:
-                if last_bytes is None:
-                    # nothing produced; skip this subkeyword
-                    continue
-                ok_img = last_bytes
-
-            # save blog size
-            try:
-                im = Image.open(io.BytesIO(ok_img)).convert("RGB")
-            except Exception:
-                st.error(f"{active_kw}: Failed to decode image.")
+        created = 0
+        for kw in keywords:
+            cands = all_candidates.get(kw, [])
+            if not cands:
+                st.error(f"No image for: {kw}")
                 continue
+            sel_idx = selections.get(kw, -1)
+            cand = cands[0] if sel_idx < 0 else cands[sel_idx]
 
-            base_slug = slugify(active_kw)
-            suffix = "" if len(all_subkws)==1 else f"-{j}"
-            fname_blog = f"{base_slug}{suffix}.webp"
-            webp_bytes = save_webp_bytes(im, DEFAULT_OUTPUT_W, DEFAULT_OUTPUT_H, webp_quality)
-            zf.writestr(fname_blog, webp_bytes)
-            gallery.append((fname_blog, webp_bytes))
+            # Save 1200x675
+            try:
+                webp = to_webp_bytes(cand["full_bytes"], WEBP_W, WEBP_H, quality)
+                fname = f"{slugify(kw)}.webp"
+                zf.writestr(fname, webp)
+                meta_rows.append((fname, kw, cand["source"], cand["title"], cand["credit"], cand["license"], cand["credit_url"] or ""))
 
-            if make_pins:
-                fname_pin = f"{base_slug}{suffix}-pin.webp"
-                pin_bytes = save_webp_bytes(im, PIN_OUTPUT_W, PIN_OUTPUT_H, webp_quality)
-                zf.writestr(fname_pin, pin_bytes)
-                gallery.append((fname_pin, pin_bytes))
+                # Pinterest optional
+                if make_pin:
+                    pin = to_webp_bytes(cand["full_bytes"], 1000, 1500, quality)
+                    pin_name = f"{slugify(kw)}-pinterest.webp"
+                    zf.writestr(pin_name, pin)
+                    meta_rows.append((pin_name, kw, cand["source"], cand["title"], cand["credit"], cand["license"], cand["credit_url"] or ""))
 
-        progress.progress(i/len(keywords))
+                created += 1
+            except Exception as e:
+                st.error(f"{kw}: failed to process — {e}")
 
-    zf.close(); zip_buf.seek(0)
-    st.success("Done! Download your images below.")
-    st.download_button("⬇️ Download ZIP", data=zip_buf,
-                       file_name=f"{slugify(site)}_images.zip", mime="application/zip")
+        # metadata.csv
+        with io.StringIO(newline="") as csv_buf:
+            writer = csv.writer(csv_buf)
+            writer.writerows(meta_rows)
+            zf.writestr("metadata.csv", csv_buf.getvalue())
 
-    st.markdown("### Previews & individual downloads")
-    cols = st.columns(3)
-    for k,(fname, data_bytes) in enumerate(gallery):
-        with cols[k % 3]:
-            st.image(data_bytes, caption=fname, use_container_width=True)
-            st.download_button("Download", data=data_bytes, file_name=fname,
-                               mime="image/webp", key=f"dl_{k}")
+        zf.close()
+        zip_buf.seek(0)
+
+        if created:
+            st.success(f"Done! {created} image set(s) created. Download your ZIP below.")
+            st.download_button(
+                "⬇️ Download ZIP",
+                data=zip_buf,
+                file_name=f"imageforge_real_photos_{int(time.time())}.zip",
+                mime="application/zip"
+            )
+        else:
+            st.warning("No images were created.")
+
+# ------------------------- FOOTER -------------------------
+st.markdown("---")
+st.caption(
+    "Sources prioritized: Google Places Photos → Street View (watermark must remain) → Openverse (CC). "
+    "Keep the attribution from **metadata.csv** with each image you publish."
+)
