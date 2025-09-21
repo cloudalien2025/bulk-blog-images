@@ -1,30 +1,20 @@
-# ImageForge v3.0 — Dual Mode (Real Photos or AI Render) + Per-Card "Generate Image"
-# ----------------------------------------------------------------------------------
-# Features
-# • Mode toggle: Real Photos (Google Places/Street View/SerpAPI) OR AI Render (OpenAI)
-# • Clear per-card button: "Generate Image" (replaces Make WebP)
-# • Immediate success/error feedback + on-card download buttons
-# • LSI expansion (Heuristic or OpenAI) + images-per-keyword
-# • Site style selector (affects prompts/filenames)
-# • Optional Pinterest image (1000x1500)
-# • SerpAPI thumbnails can be hidden
-#
-# Notes
-# • For Real Photos, only Google Places Photo & Street View export (SerpAPI is reference-only).
-# • For AI Render, we use OpenAI Images ("gpt-image-1"). We omit `response_format` to avoid
-#   the 400 'unknown parameter' issue you've hit. We fetch via returned URL.
-# • Provide your own API keys in the sidebar.
+# ImageForge v3.2 — Real Photos or AI Render
+# Changes from v3.1:
+# - Replaced per-card form_submit_button with a plain st.button("Create Image")
+#   and a forced st.rerun() after success so the UI always updates.
+# - Clear toast/success/error feedback on click.
+# - Everything else retained (Real/AI modes, LSI, Street View radius, SerpAPI toggle, per-card downloads).
 
 import io
 import re
 import json
-from typing import List, Optional, Dict, Tuple
+from typing import List, Optional, Dict
 
 import requests
 from PIL import Image, UnidentifiedImageError
 import streamlit as st
 
-APP_NAME = "ImageForge v3.0 — Real Photos or AI Render"
+APP_NAME = "ImageForge v3.2 — Real Photos or AI Render"
 
 # -------------- Output sizes --------------
 MAIN_W, MAIN_H = 1200, 675
@@ -211,7 +201,6 @@ def lsi_terms_heuristic(keyword: str, site: str, count: int) -> List[str]:
     return bits[:max(0, count)]
 
 def openai_image_url(api_key: str, prompt: str, size: str = "1536x1024") -> Optional[str]:
-    # We OMIT response_format to avoid the 'unknown parameter' error you saw.
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     payload = {"model": "gpt-image-1", "prompt": prompt, "size": size}
     try:
@@ -230,7 +219,6 @@ def build_site_prompt(site: str, keyword: str) -> str:
         "bostonvacay.com": "Photorealistic Boston neighborhoods/harbor/brick streets; coastal light; no brands; no text.",
         "ipetzo.com":      "Photorealistic lifestyle/travel scenes; neutral; no brands; no text.",
     }.get(site, "Photorealistic editorial travel stock image; no text.")
-    # Very light season cue (safe, generic)
     style = "balanced composition; natural light; editorial stock feel."
     return (f"{base} Create an image for: '{keyword}'. Landscape orientation. {style}")
 
@@ -260,7 +248,7 @@ with st.sidebar:
 
     st.subheader("Keys")
     gmaps_key = st.text_input("Google Maps/Places API key", type="password")
-    serp_key  = st.text_input("SerpAPI key (optional)", type="password")
+    serp_key  = st.text_input("SerpAPI key (optional, thumbnails only)", type="password")
     openai_key = st.text_input("OpenAI API key (for AI/LSI)", type="password")
 
     st.subheader("Site style")
@@ -294,7 +282,7 @@ keywords_text = st.text_area(
 go = st.button("Find thumbnails" if mode=="Real Photos" else "Prepare prompts")
 
 if "export_slots" not in st.session_state:
-    st.session_state.export_slots = {}  # {unique_key: bytes}
+    st.session_state.export_slots = {}
 
 # ---------- Real Photos helpers ----------
 
@@ -375,7 +363,7 @@ def place_fetch_all_candidates(kw: str) -> List[Candidate]:
             )
             idx_counter += 1
 
-    # SerpAPI (reference only)
+    # SerpAPI thumbnails (reference only)
     if 'include_serpapi' in globals() and include_serpapi and serp_key:
         for m in serpapi_images(kw, serp_key, num=6):
             thumb = None
@@ -402,33 +390,13 @@ def render_real_card(display_kw: str, site: str, c: Candidate):
         st.image(c.preview, use_container_width=True)
     else:
         st.info("No preview available.")
-
     st.caption(f"License: {c.license_str}\n\nCredit: {c.credit}")
 
-    col1, col2 = st.columns([1,1])
-    with col1:
-        if c.reference_only:
-            st.button("Why I can't export this", key=f"why_{display_kw}_{c.idx}",
-                      help="SerpAPI/Google Images are reference-only. Use a Places Photo or Street View.")
-        else:
-            if st.button("Generate Image", key=f"gen_{display_kw}_{c.idx}"):
-                with st.spinner("Fetching and converting..."):
-                    img = c.fetch_full()
-                    if not img and c.preview:
-                        img = valid_img_bytes(c.preview)
-                    if not img:
-                        st.error("Could not fetch a valid image. Try a different card or increase Street View radius.")
-                    else:
-                        slug = slugify(f"{site}-{display_kw}")
-                        webp_main = to_webp_bytes(img, MAIN_W, MAIN_H, webp_quality)
-                        st.session_state.export_slots[f"{display_kw}_{c.idx}_main"] = webp_main
-                        if make_pin:
-                            pin_bytes = to_webp_bytes(img, PIN_W, PIN_H, webp_quality)
-                            st.session_state.export_slots[f"{display_kw}_{c.idx}_pin"] = pin_bytes
-                        st.success("Done! Download buttons are on this card.")
-
-    with col2:
-        main_key = f"{display_kw}_{c.idx}_main"
+    # Download buttons if already generated
+    main_key = f"{display_kw}_{c.idx}_main"
+    pin_key  = f"{display_kw}_{c.idx}_pin"
+    cols_d = st.columns(2)
+    with cols_d[0]:
         if main_key in st.session_state.export_slots:
             st.download_button(
                 "Download WebP",
@@ -437,7 +405,7 @@ def render_real_card(display_kw: str, site: str, c: Candidate):
                 mime="image/webp",
                 key=f"dl_{display_kw}_{c.idx}_main"
             )
-        pin_key = f"{display_kw}_{c.idx}_pin"
+    with cols_d[1]:
         if pin_key in st.session_state.export_slots:
             st.download_button(
                 "Download Pinterest WebP",
@@ -447,11 +415,61 @@ def render_real_card(display_kw: str, site: str, c: Candidate):
                 key=f"dl_{display_kw}_{c.idx}_pin"
             )
 
+    # ACTION: Create Image
+    disabled = c.reference_only
+    if disabled:
+        st.warning("Reference-only (SerpAPI). Pick a Places Photo or Street View card to create an image.")
+    clicked = st.button("Create Image", key=f"create_{display_kw}_{c.idx}", disabled=disabled)
+
+    if clicked and (not disabled):
+        with st.spinner("Fetching and converting…"):
+            try:
+                img = c.fetch_full()
+            except Exception:
+                img = None
+            if not img and c.preview:
+                img = valid_img_bytes(c.preview)
+            if not img:
+                st.error("Could not fetch a valid image. Try another card or increase Street View radius.")
+            else:
+                webp_main = to_webp_bytes(img, MAIN_W, MAIN_H, webp_quality)
+                st.session_state.export_slots[main_key] = webp_main
+                if make_pin:
+                    st.session_state.export_slots[pin_key] = to_webp_bytes(img, PIN_W, PIN_H, webp_quality)
+                st.toast("Image created — download button added.")
+                st.rerun()  # ensure the new download buttons appear immediately
+
+
 # ---------- AI helpers ----------
 
 def render_ai_slot(display_kw: str, site: str, base_size: str):
     st.markdown(f"**{display_kw}**")
-    if st.button("Generate Image", key=f"ai_{display_kw}"):
+
+    # Show download buttons if already generated
+    main_key = f"{display_kw}_ai_main"
+    pin_key  = f"{display_kw}_ai_pin"
+    cols_d = st.columns(2)
+    with cols_d[0]:
+        if main_key in st.session_state.export_slots:
+            st.download_button(
+                "Download WebP",
+                data=st.session_state.export_slots[main_key],
+                file_name=f"{slugify(site)}-{slugify(display_kw)}.webp",
+                mime="image/webp",
+                key=f"dl_{display_kw}_ai_main"
+            )
+    with cols_d[1]:
+        if pin_key in st.session_state.export_slots:
+            st.download_button(
+                "Download Pinterest WebP",
+                data=st.session_state.export_slots[pin_key],
+                file_name=f"{slugify(site)}-{slugify(display_kw)}_pin.webp",
+                mime="image/webp",
+                key=f"dl_{display_kw}_ai_pin"
+            )
+
+    clicked = st.button("Create Image", key=f"create_ai_{display_kw}")
+    if clicked:
         if not openai_key:
             st.error("OpenAI API key is required for AI Render.")
             return
@@ -469,32 +487,12 @@ def render_ai_slot(display_kw: str, site: str, base_size: str):
             if not img:
                 st.error("Downloaded image was invalid.")
                 return
-            slug = slugify(f"{site}-{display_kw}")
-            webp_main = to_webp_bytes(img, MAIN_W, MAIN_H, webp_quality)
-            st.session_state.export_slots[f"{display_kw}_ai_main"] = webp_main
+            st.session_state.export_slots[main_key] = to_webp_bytes(img, MAIN_W, MAIN_H, webp_quality)
             if make_pin:
-                pin = to_webp_bytes(img, PIN_W, PIN_H, webp_quality)
-                st.session_state.export_slots[f"{display_kw}_ai_pin"] = pin
-            st.success("Done! Download below.")
+                st.session_state.export_slots[pin_key] = to_webp_bytes(img, PIN_W, PIN_H, webp_quality)
+            st.toast("Image created — download button added.")
+            st.rerun()
 
-    main_key = f"{display_kw}_ai_main"
-    if main_key in st.session_state.export_slots:
-        st.download_button(
-            "Download WebP",
-            data=st.session_state.export_slots[main_key],
-            file_name=f"{slugify(site)}-{slugify(display_kw)}.webp",
-            mime="image/webp",
-            key=f"dl_{display_kw}_ai_main"
-        )
-    pin_key = f"{display_kw}_ai_pin"
-    if pin_key in st.session_state.export_slots:
-        st.download_button(
-            "Download Pinterest WebP",
-            data=st.session_state.export_slots[pin_key],
-            file_name=f"{slugify(site)}-{slugify(display_kw)}_pin.webp",
-            mime="image/webp",
-            key=f"dl_{display_kw}_ai_pin"
-        )
 
 # ================== Main ==================
 
