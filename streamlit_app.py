@@ -1,28 +1,24 @@
-# ImageForge v2.0 — Real Photos + LSI + Per-Card Generate
-# -------------------------------------------------------
+# ImageForge v2.1 — Real Photos + LSI + Per-Card Generate (with SerpAPI toggle + explicit feedback)
+# -----------------------------------------------------------------------------------------------
 # - Real photos first: Google Places Photos -> Street View (radius slider)
-# - SerpAPI thumbnails (reference-only) for visual confirmation
+# - Optional SerpAPI thumbnails (reference only) can be hidden via sidebar
 # - Optional OpenAI for LSI keyword expansion (text only)
 # - Blog/site style selector (affects filenames/metadata and LSI hints)
 # - Images-per-keyword (LSI expansion)
 # - Manual pick with clearly labeled thumbnails and a per-card "Make WebP" button
 # - Exports 1200x675 WebP (+ optional Pinterest 1000x1500)
-# - Robust image validation and clear error messages
+# - Robust image validation, explicit success/error messages
 
 import io
 import re
-import csv
 import json
-import time
-import base64
-import zipfile
 from typing import List, Optional, Dict, Tuple
 
 import requests
 from PIL import Image, UnidentifiedImageError
 import streamlit as st
 
-APP_NAME = "ImageForge v2.0 — Real Photos + LSI + Per-Card Generate"
+APP_NAME = "ImageForge v2.1 — Real Photos + LSI + Per-Card Generate"
 
 # Output sizes
 MAIN_W, MAIN_H = 1200, 675
@@ -38,9 +34,9 @@ SV_META_URL           = "https://maps.googleapis.com/maps/api/streetview/metadat
 # SerpAPI
 SERPAPI_IMG_URL = "https://serpapi.com/search.json"
 
-# OpenAI
+# OpenAI (for LSI only)
 OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions"
-OPENAI_MODEL = "gpt-4o-mini"  # for short, cheap LSI only
+OPENAI_MODEL = "gpt-4o-mini"
 
 
 # ---------------------------
@@ -116,9 +112,12 @@ def place_details_photos(api_key: str, place_id: str) -> List[Dict]:
 
 def fetch_places_photo(api_key: str, photo_ref: str, max_w: int = 1600) -> Optional[Image.Image]:
     try:
-        r = requests.get(PLACES_PHOTO_URL, params={
-            "photoreference": photo_ref, "maxwidth": str(max_w), "key": api_key
-        }, timeout=30, allow_redirects=True)
+        r = requests.get(
+            PLACES_PHOTO_URL,
+            params={"photoreference": photo_ref, "maxwidth": str(max_w), "key": api_key},
+            timeout=30,
+            allow_redirects=True,
+        )
         if r.status_code == 200:
             return valid_img_bytes(r.content)
     except requests.RequestException:
@@ -174,7 +173,6 @@ def serpapi_images(query: str, serp_key: str, num: int = 4) -> List[Dict]:
 # ---------------------------
 
 def lsi_terms_openai(api_key: str, keyword: str, site_hint: str, count: int) -> List[str]:
-    """Ask OpenAI for short, closely related search phrases (no punctuation)."""
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     prompt = (
         f"Generate {count} short LSI keyword variations for the topic below. "
@@ -194,18 +192,15 @@ def lsi_terms_openai(api_key: str, keyword: str, site_hint: str, count: int) -> 
             return []
         js = r.json()
         content = js["choices"][0]["message"]["content"]
-        # Try to parse JSON array
         arr = json.loads(content)
         return [str(x).strip() for x in arr if str(x).strip()]
     except Exception:
         return []
 
 def lsi_terms_heuristic(keyword: str, site: str, count: int) -> List[str]:
-    base = keyword
-    bits = []
     if "vail" in keyword.lower():
         bits = ["lionshead village", "vail village", "mountain views", "patio dining", "gondola nearby",
-                "family friendly", "best breakfast", "happy hour", "views of gore creek", "apres ski"]
+                "family friendly", "best breakfast", "happy hour", "gore creek", "apres ski"]
     elif "bangkok" in keyword.lower():
         bits = ["yaowarat", "sukhumvit", "rooftop views", "night market", "street food",
                 "best pad thai", "iconic temples", "riverside", "late night", "cozy cafe"]
@@ -233,7 +228,6 @@ class Candidate:
         self.reference_only = reference_only
         self.credit = credit
         self.license_str = license_str
-        # Callable returns a PIL.Image at highest quality available
         self.fetch_full = fetch_full_callable
 
 
@@ -243,13 +237,12 @@ class Candidate:
 
 st.set_page_config(page_title=APP_NAME, layout="wide")
 st.title(APP_NAME)
-st.caption("Pick a thumbnail and press **Make WebP** on its card to instantly get a download button. "
-           "Only **Places Photos** and **Street View** export. SerpAPI images are **reference-only**.")
+st.caption("Pick a thumbnail and press **Make WebP** on its card. "
+           "Only **Places Photos** and **Street View** export. SerpAPI images are **reference-only** (optional to show).")
 
 with st.sidebar:
     st.subheader("Keys")
-    gmaps_key = st.text_input("Google Maps/Places API key (required)", type="password",
-                              help="Enable Places API + Street View Static API in the same project.")
+    gmaps_key = st.text_input("Google Maps/Places API key (required)", type="password")
     serp_key  = st.text_input("SerpAPI key (optional)", type="password")
     openai_key = st.text_input("OpenAI API key (optional, LSI only)", type="password")
 
@@ -269,19 +262,22 @@ with st.sidebar:
     st.subheader("Street View")
     sv_radius = st.slider("Search radius (meters)", 50, 500, 250)
 
-    st.subheader("Picker & LSI")
-    images_per_kw = st.number_input("Images per keyword (LSI expansion)", 1, 12, 1, help="How many images you want per line. If >1, we expand with LSI.")
+    st.subheader("Thumbnails")
+    include_serpapi = st.checkbox("Include SerpAPI thumbnails (reference-only)", value=False,
+                                  help="Uncheck to remove SerpAPI cards completely.")
+
+    st.subheader("LSI & quantity")
+    images_per_kw = st.number_input("Images per keyword (LSI expansion)", 1, 12, 1)
     lsi_method = st.selectbox("LSI method", ["Heuristic", "OpenAI (if key provided)"])
 
-# Input
 keywords_text = st.text_area("Paste keywords (one per line)", height=140,
                              placeholder="Blue Moose Pizza, Vail Colorado\nTavern on the Square, Vail Colorado")
 go = st.button("Find thumbnails")
 
 if "export_slots" not in st.session_state:
-    st.session_state.export_slots = {}  # {unique_key: webp_bytes}
+    st.session_state.export_slots = {}  # {unique_key: bytes}
 
-def place_fetch_all_candidates(kw: str, site_hint: str) -> List[Candidate]:
+def place_fetch_all_candidates(kw: str) -> List[Candidate]:
     cands: List[Candidate] = []
     if not gmaps_key:
         return cands
@@ -302,18 +298,23 @@ def place_fetch_all_candidates(kw: str, site_hint: str) -> List[Candidate]:
         photos = place_details_photos(gmaps_key, pid)
         for p in photos[:6]:
             ref = p.get("photo_reference")
+
             # small preview
-            im = fetch_places_photo(gmaps_key, ref, max_w=1280)
             prev = None
-            if im:
+            im_small = fetch_places_photo(gmaps_key, ref, max_w=1024)
+            if im_small:
                 prev = io.BytesIO()
-                crop_resize(im, 800, 450).save(prev, "WEBP", quality=80)
+                crop_resize(im_small, 800, 450).save(prev, "WEBP", quality=80)
                 prev = prev.getvalue()
 
             def make_fetch_full(ref=ref):
                 def _f():
-                    big = fetch_places_photo(gmaps_key, ref, max_w=2048)
-                    return big
+                    # try higher width first, then a second-chance lower width
+                    for w in (2048, 1600, 1200):
+                        im = fetch_places_photo(gmaps_key, ref, max_w=w)
+                        if im:
+                            return im
+                    return None
                 return _f
 
             cands.append(
@@ -341,7 +342,12 @@ def place_fetch_all_candidates(kw: str, site_hint: str) -> List[Candidate]:
 
             def make_sv_full(lat=lat, lng=lng, r=sv_radius):
                 def _f():
-                    return fetch_streetview(gmaps_key, lat, lng, r, size=(2048, 1152))
+                    # attempt bigger first then fallback
+                    for size in ((2048,1152),(1600,900),(1280,720)):
+                        im = fetch_streetview(gmaps_key, lat, lng, r, size=size)
+                        if im:
+                            return im
+                    return None
                 return _f
 
             cands.append(
@@ -359,7 +365,7 @@ def place_fetch_all_candidates(kw: str, site_hint: str) -> List[Candidate]:
             idx_counter += 1
 
     # SerpAPI thumbnails (reference only)
-    if serp_key:
+    if include_serpapi and serp_key:
         for m in serpapi_images(kw, serp_key, num=4):
             thumb = None
             if m.get("thumbnail"):
@@ -382,7 +388,7 @@ def place_fetch_all_candidates(kw: str, site_hint: str) -> List[Candidate]:
 
     return cands
 
-def render_candidate_card(kw: str, site: str, c: Candidate):
+def render_candidate_card(display_kw: str, site: str, c: Candidate):
     st.markdown(f"**[{c.idx}] {c.source} — {c.title} {'(reference-only)' if c.reference_only else ''}**")
     if c.preview:
         st.image(c.preview, use_container_width=True)
@@ -394,45 +400,47 @@ def render_candidate_card(kw: str, site: str, c: Candidate):
     col1, col2 = st.columns([1,1])
     with col1:
         if c.reference_only:
-            st.button("Why I can't export this", key=f"why_{kw}_{c.idx}",
+            st.button("Why I can't export this", key=f"why_{display_kw}_{c.idx}",
                       help="SerpAPI/Google Images results are for reference only. Use a Google Places Photo or Street View to export.")
         else:
-            if st.button("Make WebP", key=f"make_{kw}_{c.idx}"):
-                img = c.fetch_full()
-                if not img and c.preview:
-                    img = valid_img_bytes(c.preview)
-                if not img:
-                    st.error("Could not fetch a valid image for export.")
-                else:
-                    # Export main
-                    slug = slugify(f"{site}-{kw}")
-                    webp_main = to_webp_bytes(img, MAIN_W, MAIN_H, webp_quality)
-                    st.session_state.export_slots[f"{kw}_{c.idx}_main"] = webp_main
-
-                    if make_pin:
-                        pin_bytes = to_webp_bytes(img, PIN_W, PIN_H, webp_quality)
-                        st.session_state.export_slots[f"{kw}_{c.idx}_pin"] = pin_bytes
+            if st.button("Make WebP", key=f"make_{display_kw}_{c.idx}"):
+                with st.spinner("Fetching and converting..."):
+                    img = c.fetch_full()
+                    if not img and c.preview:
+                        img = valid_img_bytes(c.preview)
+                    if not img:
+                        st.error("Could not fetch a valid image for export. Try another thumbnail or increase Street View radius.")
+                    else:
+                        slug = slugify(f"{site}-{display_kw}")
+                        webp_main = to_webp_bytes(img, MAIN_W, MAIN_H, webp_quality)
+                        st.session_state.export_slots[f"{display_kw}_{c.idx}_main"] = webp_main
+                        if make_pin:
+                            pin_bytes = to_webp_bytes(img, PIN_W, PIN_H, webp_quality)
+                            st.session_state.export_slots[f"{display_kw}_{c.idx}_pin"] = pin_bytes
+                        st.success("Done! Download buttons are available on this card.")
 
     with col2:
-        main_key = f"{kw}_{c.idx}_main"
+        main_key = f"{display_kw}_{c.idx}_main"
         if main_key in st.session_state.export_slots:
             st.download_button(
                 "Download WebP",
                 data=st.session_state.export_slots[main_key],
-                file_name=f"{slugify(site)}-{slugify(kw)}.webp",
+                file_name=f"{slugify(site)}-{slugify(display_kw)}.webp",
                 mime="image/webp",
-                key=f"dl_{kw}_{c.idx}_main"
+                key=f"dl_{display_kw}_{c.idx}_main"
             )
-        pin_key = f"{kw}_{c.idx}_pin"
+        pin_key = f"{display_kw}_{c.idx}_pin"
         if pin_key in st.session_state.export_slots:
             st.download_button(
                 "Download Pinterest WebP",
                 data=st.session_state.export_slots[pin_key],
-                file_name=f"{slugify(site)}-{slugify(kw)}_pin.webp",
+                file_name=f"{slugify(site)}-{slugify(display_kw)}_pin.webp",
                 mime="image/webp",
-                key=f"dl_{kw}_{c.idx}_pin"
+                key=f"dl_{display_kw}_{c.idx}_pin"
             )
 
+# Main flow
+st.divider()
 if go:
     if not gmaps_key:
         st.error("Please provide your Google Maps/Places API key.")
@@ -460,12 +468,11 @@ if go:
 
     for i, (display_kw, base_kw) in enumerate(all_tasks, start=1):
         st.markdown(f"### {i}/{len(all_tasks)} — {display_kw}")
-        cands = place_fetch_all_candidates(display_kw, site_hint)
+        cands = place_fetch_all_candidates(display_kw)
         if not cands:
             st.warning("No thumbnails found here. Try another radius or slightly different phrasing.")
             continue
 
-        # Show cards with per-card Generate
         cols = st.columns(3)
         for idx, cand in enumerate(cands):
             with cols[idx % 3]:
