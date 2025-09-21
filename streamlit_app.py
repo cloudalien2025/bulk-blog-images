@@ -101,26 +101,7 @@ def build_prompt(site: str, keyword: str, season_hint: Optional[str]=None) -> st
 # --------------------------
 # OpenAI Images (AI Render)
 # --------------------------
-def openai_generate_image_png(prompt: str, api_key: str) -> bytes:
-    """
-    Call OpenAI Images with a safe size (1024x1024), then we crop/resize locally.
-    """
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    payload = {
-        "model": "gpt-image-1",
-        "prompt": prompt,
-        "size": "1024x1024",        # <-- API-supported size (prevents 400)
-        "response_format": "b64_json"
-    }
-    r = requests.post("https://api.openai.com/v1/images/generations",
-                      headers=headers, json=payload, timeout=120)
-    try:
-        r.raise_for_status()
-    except requests.HTTPError:
-        st.error(f"OpenAI error {r.status_code}: {r.text}")
-        raise
-    b64 = r.json()["data"][0]["b64_json"]
-    return base64.b64decode(b64)  # PNG bytes
+openai_generate_image_png
 
 # --------------------------
 # Google Places / Street View
