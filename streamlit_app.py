@@ -1,337 +1,485 @@
-# ImageForge v1.3.3 — patch over v1.3.2
-# Changes vs 1.3.2 (only):
-# - Fix AI Render: remove response_format; support b64_json or url responses
-# - Normalize size to valid OpenAI sizes; add 'auto' handling
-# - No other functional changes
+# ImageForge v1.3 — Real Photos + AI Render (fixed SerpAPI filtering, per-card Create Image)
+# ------------------------------------------------------------
+# Requirements: streamlit, requests, pillow
+#   pip install streamlit requests pillow
+#
+# IMPORTANT: Enable these Google APIs on your project if using Real Photos mode:
+#   • Places API (or Places API (New))
+#   • Street View Static API
+#
+# Notes:
+# - SerpAPI is optional and strictly off unless the box is checked.
+# - We never persist or prefill API keys.
+# - OpenAI image call has a retry path that removes 'response_format' if the API rejects it.
+
+from __future__ import annotations
 
 import base64
 import io
-import os
+import json
 import re
 import time
+from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 import requests
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, ImageOps
 import streamlit as st
 
-# --------------------------
-# Constants (unchanged API/UI except where noted)
-# --------------------------
 
-OPENAI_IMAGE_MODEL = "gpt-image-1"
+# -----------------------------
+# App constants & helpers
+# -----------------------------
 
-# Only sizes OpenAI accepts. We keep "auto" in the UI but normalize it below.
-OPENAI_ALLOWED_SIZES = ["1024x1024", "1024x1536", "1536x1024", "auto"]
+APP_NAME = "ImageForge v1.3"
+OUTPUT_W, OUTPUT_H = 1200, 675
+PINTEREST_W, PINTEREST_H = 1000, 1500
+OPENAI_IMAGE_SIZES = ("1536x1024", "1024x1536", "1024x1024")
 
-DEFAULT_WEBP_QUALITY = 82
+SITE_PROFILES = {
+    "vailvacay.com":  "Photoreal mountain resort scenes (Vail/Beaver Creek); alpine village; gondola lifts; Rocky Mountains; no logos; no text.",
+    "bangkokvacay.com":"Photoreal Bangkok city life; night markets, Chinatown, BTS/MRT scenes; temples; tuk-tuks; warm ambient light; no logos; no text.",
+    "bostonvacay.com": "Photoreal Boston & New England; brownstones, harbor, fall color; cafes; cobblestones; no logos; no text.",
+    "ipetzo.com":      "Photoreal pet lifestyle; dogs and cats with people in tasteful settings; clean backgrounds; no visible branding; no text.",
+    "1-800deals.com":  "Photoreal retail & ecommerce visuals; packages, carts, unbranded products; bright clean light; no logos; no text.",
+}
+DEFAULT_SITE = "vailvacay.com"
 
-# --------------------------
-# Utilities
-# --------------------------
 
-def clamp_openai_size(size_in: str) -> str:
-    """Return a valid OpenAI size (or fallback)."""
-    if not size_in:
-        return "1024x1024"
-    s = size_in.strip().lower()
-    if s not in OPENAI_ALLOWED_SIZES:
-        # Normalize anything invalid to 1024x1024 (prevents 'invalid_value' errors)
-        return "1024x1024"
-    if s == "auto":
-        # Our 'auto' policy: square default for safety
-        return "1024x1024"
-    return s
+@dataclass
+class Candidate:
+    title: str
+    source: str
+    preview_bytes: bytes
+    license_note: str
 
-def to_webp_bytes(pil: Image.Image, quality: int = DEFAULT_WEBP_QUALITY) -> bytes:
+
+def slugify(text: str) -> str:
+    t = text.lower().strip()
+    t = re.sub(r"[’'`]", "", t)
+    t = re.sub(r"[^a-z0-9]+", "-", t).strip("-")
+    return t
+
+
+def crop_resize_to(img: Image.Image, w: int, h: int) -> Image.Image:
+    # letter-safe crop to aspect, then resize
+    t_ratio = w / h
+    iw, ih = img.size
+    if iw / ih > t_ratio:
+        new_w = int(ih * t_ratio)
+        x0 = (iw - new_w) // 2
+        box = (x0, 0, x0 + new_w, ih)
+    else:
+        new_h = int(iw / t_ratio)
+        y0 = (ih - new_h) // 2
+        box = (0, y0, iw, y0 + new_h)
+    return img.crop(box).resize((w, h), Image.LANCZOS)
+
+
+def to_webp_bytes(img_bytes: bytes, w: int, h: int, quality: int) -> bytes:
+    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+    img = crop_resize_to(img, w, h)
     buf = io.BytesIO()
-    pil.save(buf, format="WEBP", quality=int(quality))
+    img.save(buf, "WEBP", quality=max(60, min(95, quality)), method=6)
     return buf.getvalue()
 
-def safe_pil_from_bytes(b: bytes) -> Optional[Image.Image]:
-    try:
-        return Image.open(io.BytesIO(b)).convert("RGB")
-    except UnidentifiedImageError:
+
+# -----------------------------
+# Google / SerpAPI fetchers
+# -----------------------------
+
+def google_textsearch_place(query: str, gmaps_key: str) -> Optional[dict]:
+    url = "https://maps.googleapis.com/maps/api/place/textsearch/json"
+    r = requests.get(url, params={"query": query, "key": gmaps_key}, timeout=30)
+    if r.status_code != 200:
         return None
+    data = r.json()
+    return (data.get("results") or [None])[0]
 
-def decode_b64_image(b64_string: str) -> Optional[bytes]:
-    try:
-        return base64.b64decode(b64_string)
-    except Exception:
-        return None
 
-# --------------------------
-# OpenAI (AI Render) — patched
-# --------------------------
+def google_place_details(place_id: str, gmaps_key: str) -> dict:
+    url = "https://maps.googleapis.com/maps/api/place/details/json"
+    r = requests.get(url, params={
+        "place_id": place_id,
+        "fields": "name,geometry,photos",
+        "key": gmaps_key
+    }, timeout=30)
+    return (r.json() or {}).get("result", {}) if r.status_code == 200 else {}
 
-def openai_generate_image_bytes(
-    api_key: str,
-    prompt: str,
-    size_str: str,
-) -> Tuple[Optional[bytes], Optional[str]]:
-    """
-    Return (image_bytes, error_message).
-    Patched for the latest OpenAI Images API:
-      - Do NOT send response_format
-      - Accept b64_json or url, fetch bytes if needed
-    """
-    import openai  # relies on openai>=1.0.0 package
-    client = openai.OpenAI(api_key=api_key)
 
-    normalized_size = clamp_openai_size(size_str)
-
-    try:
-        # No response_format; let the API decide (b64_json for most accounts)
-        resp = client.images.generate(
-            model=OPENAI_IMAGE_MODEL,
-            prompt=prompt,
-            size=normalized_size,
-            n=1,
-        )
-    except Exception as e:
-        return None, f"OpenAI error: {e}"
-
-    try:
-        data0 = resp.data[0]
-    except Exception:
-        return None, "OpenAI error: Unexpected response shape."
-
-    # Try b64 first
-    b64 = getattr(data0, "b64_json", None)
-    if b64:
-        raw = decode_b64_image(b64)
-        if raw:
-            return raw, None
-
-    # Fallback to URL if present
-    url = getattr(data0, "url", None)
-    if url:
-        try:
-            r = requests.get(url, timeout=30)
-            r.raise_for_status()
-            return r.content, None
-        except Exception as e:
-            return None, f"OpenAI error: failed to fetch image URL — {e}"
-
-    return None, "OpenAI error: API returned neither b64_json nor url."
-
-# --------------------------
-# Real Photos (v1.3.2 logic placeholder)
-# NOTE: Nothing changed here for the patch. Only AI path was fixed.
-# --------------------------
-
-def gmaps_photo_bytes(places_api_key: str, photo_reference: str, maxwidth: int = 1200) -> Optional[bytes]:
-    if not photo_reference:
-        return None
+def google_photo_bytes(photo_ref: str, gmaps_key: str, max_w: int = 1600) -> Optional[bytes]:
     url = "https://maps.googleapis.com/maps/api/place/photo"
-    params = {"maxwidth": maxwidth, "photoreference": photo_reference, "key": places_api_key}
-    try:
-        r = requests.get(url, params=params, timeout=30)
-        r.raise_for_status()
+    # We must follow redirect to the actual image URL
+    r = requests.get(url, params={"photoreference": photo_ref, "maxwidth": max_w, "key": gmaps_key},
+                     timeout=30, allow_redirects=False)
+    # Sometimes Google returns a 302 with Location
+    loc = r.headers.get("Location")
+    if loc:
+        img = requests.get(loc, timeout=30)
+        if img.status_code == 200:
+            return img.content
+    # fallback if direct
+    if r.status_code == 200 and r.content:
         return r.content
-    except Exception:
-        return None
+    return None
 
-def street_view_bytes(gmaps_key: str, lat: float, lng: float, width: int = 1200, height: int = 800) -> Optional[bytes]:
-    base = "https://maps.googleapis.com/maps/api/streetview"
-    params = {"size": f"{width}x{height}", "location": f"{lat},{lng}", "key": gmaps_key}
-    try:
-        r = requests.get(base, params=params, timeout=30)
-        r.raise_for_status()
+
+def streetview_bytes(lat: float, lng: float, gmaps_key: str, radius_m: int = 250,
+                     size_w: int = 1024, size_h: int = 1024) -> Optional[bytes]:
+    # Try metadata first to confirm panorama availability
+    meta = requests.get(
+        "https://maps.googleapis.com/maps/api/streetview/metadata",
+        params={"location": f"{lat},{lng}", "radius": radius_m, "key": gmaps_key},
+        timeout=20,
+    ).json()
+    if meta.get("status") not in ("OK", "ZERO_RESULTS"):
+        return None
+    if meta.get("status") == "ZERO_RESULTS":
+        return None
+    # Now fetch the image
+    r = requests.get(
+        "https://maps.googleapis.com/maps/api/streetview",
+        params={"location": f"{lat},{lng}", "radius": radius_m,
+                "size": f"{size_w}x{size_h}", "key": gmaps_key},
+        timeout=30,
+    )
+    if r.status_code == 200 and r.content:
         return r.content
+    return None
+
+
+def serpapi_images(query: str, serp_key: str, num: int = 4) -> List[Tuple[str, str]]:
+    """Return list of (source, image_url). Reference-only."""
+    try:
+        r = requests.get(
+            "https://serpapi.com/search.json",
+            params={
+                "engine": "google",
+                "q": query,
+                "tbm": "isch",
+                "api_key": serp_key
+            },
+            timeout=30
+        )
+        if r.status_code != 200:
+            return []
+        data = r.json()
+        imgs = []
+        for itm in (data.get("images_results") or [])[:num]:
+            link = itm.get("original") or itm.get("thumbnail")
+            src = itm.get("source") or "Google Images via SerpAPI"
+            if link:
+                imgs.append((src, link))
+        return imgs
     except Exception:
-        return None
+        return []
 
-# --------------------------
-# UI Helpers
-# --------------------------
 
-def save_and_show(bytes_img: bytes, filename: str, webp_quality: int):
-    img = safe_pil_from_bytes(bytes_img)
-    if not img:
-        st.error("Could not decode image bytes.")
-        return
-    webp_data = to_webp_bytes(img, quality=webp_quality)
-    st.image(webp_data, caption=filename, use_container_width=True)
-    st.download_button("Download", data=webp_data, file_name=filename, type="primary")
+# -----------------------------
+# OpenAI image generation (robust)
+# -----------------------------
 
-# --------------------------
-# App
-# --------------------------
+def openai_generate_image_b64(prompt: str, size: str, api_key: str) -> bytes:
+    """Return PNG bytes from OpenAI. Retry without 'response_format' if rejected."""
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    payload = {"model": "gpt-image-1", "prompt": prompt, "size": size, "response_format": "b64_json"}
+    url = "https://api.openai.com/v1/images/generations"
+    r = requests.post(url, headers=headers, json=payload, timeout=120)
+    if r.status_code == 400 and "response_format" in (r.text or ""):
+        # Retry without response_format for older gateways
+        payload.pop("response_format", None)
+        r = requests.post(url, headers=headers, json=payload, timeout=120)
+    if r.status_code != 200:
+        raise RuntimeError(f"OpenAI error {r.status_code}: {r.text}")
+    jd = r.json()
+    if "data" in jd and jd["data"]:
+        b64 = jd["data"][0].get("b64_json")
+        if b64:
+            return base64.b64decode(b64)
+        # Fallback: some gateways return URL only
+        url = jd["data"][0].get("url")
+        if url:
+            img = requests.get(url, timeout=60)
+            if img.status_code == 200:
+                return img.content
+    raise RuntimeError("OpenAI returned no image data.")
 
-st.set_page_config(page_title="ImageForge v1.3.3", layout="wide")
 
-st.sidebar.title("AI settings")
-site_style = st.sidebar.selectbox(
-    "Site style",
-    ["vailvacay.com", "ipetzo.com", "bostonvacay.com", "bangkokvacay.com"],
-    index=0,
-)
-# LSI kept for parity; AI uses main prompt in this patch.
-lsi_method = st.sidebar.selectbox("LSI method", ["Heuristic", "None"], index=0)
-lsi_count = st.sidebar.selectbox("Images per keyword (LSI expansion)", [1, 2, 3], index=0)
+def build_ai_prompt(site: str, keyword: str) -> str:
+    base = SITE_PROFILES.get(site, SITE_PROFILES[DEFAULT_SITE])
+    k = keyword.lower()
+    style_hints = []
+    # a few light heuristics
+    if any(x in k for x in ["ski", "snow", "back bowl", "vail in january", "winter"]):
+        style_hints.append("winter setting; snow present where appropriate")
+    if any(x in k for x in ["summer", "july", "august"]):
+        style_hints.append("summer setting; green trees, bright light")
+    if any(x in k for x in ["november", "october"]):
+        style_hints.append("shoulder season feel; transitional foliage")
+    style = ", ".join(style_hints) if style_hints else "scene appropriate to the topic"
+    return (f"{base} Create a photorealistic landscape-orientation image for: '{keyword}'. "
+            f"Balanced composition; natural light; editorial stock-photo feel; "
+            f"no text or logos; no brand marks. Scene intent: {style}.")
 
-st.sidebar.subheader("Sources to use")
-use_places = st.sidebar.checkbox("Google Places Photos", value=True)
-use_street = st.sidebar.checkbox("Google Street View", value=False)
-use_serp = st.sidebar.checkbox("SerpAPI thumbnails (reference only)", value=False)
 
-st.sidebar.subheader("Street View")
-sv_radius = st.sidebar.slider("Search radius (meters)", 50, 400, 150)
+# -----------------------------
+# Real-photo candidate collector
+# -----------------------------
 
-st.sidebar.subheader("Output")
-webp_quality = st.sidebar.slider("WebP quality", 50, 100, DEFAULT_WEBP_QUALITY)
+def collect_real_photo_candidates(q: str,
+                                  use_places_flag: bool,
+                                  use_street_flag: bool,
+                                  use_serp_flag: bool,
+                                  sv_radius_m: int,
+                                  gmaps_key: str,
+                                  serp_key: Optional[str]) -> List[Candidate]:
+    cands: List[Candidate] = []
+    if not gmaps_key:
+        return cands
 
-st.title("ImageForge v1.3.3 — Real Photos first OR AI Render (OpenAI)")
+    place = google_textsearch_place(q, gmaps_key)
+    if not place:
+        return cands
 
-MODE_REAL = "Real Photos"
-MODE_AI = "AI Render"
+    details = google_place_details(place["place_id"], gmaps_key)
+    title = details.get("name") or q
+    loc = (details.get("geometry") or {}).get("location") or {}
+    lat, lng = loc.get("lat"), loc.get("lng")
 
-mode = st.radio("Mode", [MODE_REAL, MODE_AI], index=0, horizontal=True)
+    # Google Places Photos
+    if use_places_flag:
+        for ph in (details.get("photos") or [])[:12]:
+            ref = ph.get("photo_reference")
+            if not ref:
+                continue
+            try:
+                img_bytes = google_photo_bytes(ref, gmaps_key, max_w=1600)
+                if img_bytes:
+                    cands.append(Candidate(
+                        title=f"Google Places Photo — {title}",
+                        source="Google Maps contributor",
+                        preview_bytes=img_bytes,
+                        license_note="License: Refer to Google Places Photo terms",
+                    ))
+            except Exception:
+                pass
 
-st.subheader("Paste keywords (one per line)")
-kw_text = st.text_area("", height=110, placeholder="Things to do in Lionshead Vail")
+    # Google Street View
+    if use_street_flag and lat and lng:
+        try:
+            sv = streetview_bytes(lat, lng, gmaps_key, radius_m=sv_radius_m, size_w=1024, size_h=1024)
+            if sv:
+                cands.append(Candidate(
+                    title=f"Google Street View — {title}",
+                    source="Google Street View",
+                    preview_bytes=sv,
+                    license_note="License: Refer to Google Street View terms",
+                ))
+        except Exception:
+            pass
 
-# Keys (unchanged inputs)
+    # SerpAPI (reference-only) — strictly obey toggle
+    if use_serp_flag and serp_key:
+        refs = serpapi_images(q, serp_key, num=6)
+        for src, url in refs:
+            try:
+                r = requests.get(url, timeout=20)
+                if r.status_code == 200 and r.content:
+                    cands.append(Candidate(
+                        title=f"SerpAPI (Google Images, reference) — {title}",
+                        source=src + " (reference only)",
+                        preview_bytes=r.content,
+                        license_note="License: Unknown / reference-only",
+                    ))
+            except Exception:
+                pass
+
+    return cands
+
+
+# -----------------------------
+# UI
+# -----------------------------
+
+st.set_page_config(page_title=APP_NAME, layout="wide")
+st.title(f"{APP_NAME} — Real Photos + AI Render")
+
+# Mode
+mode = st.sidebar.radio("Mode", ["Real Photos", "AI Render"], index=0)
+
+# Keys
 st.sidebar.subheader("Keys")
 gmaps_key = st.sidebar.text_input("Google Maps/Places API key", type="password")
 serp_key = st.sidebar.text_input("SerpAPI key (optional)", type="password")
-openai_key = st.sidebar.text_input("OpenAI API key (for AI Render / LSI)", type="password")
+openai_key = st.sidebar.text_input("OpenAI API key (for AI Render)", type="password")
 
-# Size selector shown in AI mode only (same control name as v1.3.2)
-if mode == MODE_AI:
-    size_choice = st.selectbox(
-        "Render base size (OpenAI)",
-        OPENAI_ALLOWED_SIZES,  # UI shows only valid choices + 'auto'
-        index=0,
-    )
+# Output
+st.sidebar.subheader("Output")
+quality = st.sidebar.slider("WebP quality", 60, 95, 82)
+make_pin = st.sidebar.checkbox("Also make a Pinterest image (1000×1500)")
+
+# Site style
+st.sidebar.subheader("AI settings")
+site = st.sidebar.selectbox("Site style", list(SITE_PROFILES.keys()),
+                            index=list(SITE_PROFILES.keys()).index(DEFAULT_SITE))
+
+# LSI controls (AI only)
+st.sidebar.caption("LSI expansion is used by AI mode.")
+lsi_method = st.sidebar.selectbox("LSI method", ["Heuristic", "Off"], index=0)
+images_per_keyword = st.sidebar.number_input("Images per keyword (LSI expansion)", 1, 10, 1)
+
+# Sources (real photos)
+st.sidebar.subheader("Sources to use")
+use_places_flag = st.sidebar.checkbox("Google Places Photos", value=True, key="use_places_flag")
+use_street_flag = st.sidebar.checkbox("Google Street View", value=True, key="use_street_flag")
+use_serp_flag = st.sidebar.checkbox("SerpAPI thumbnails (reference only)", value=False, key="use_serp_flag")
+
+# Street View radius
+st.sidebar.subheader("Street View")
+sv_radius_m = st.sidebar.slider("Search radius (meters)", 25, 500, 250, key="sv_radius_m")
+
+# Invalidate old candidates if source settings change
+sources_sig = (use_places_flag, use_street_flag, use_serp_flag, sv_radius_m)
+if st.session_state.get("last_sources_sig") != sources_sig:
+    st.session_state["last_sources_sig"] = sources_sig
+    st.session_state.pop("realphoto_sets", None)
+
+# Session containers
+if "realphoto_sets" not in st.session_state:
+    st.session_state["realphoto_sets"] = {}
+if "zip_items" not in st.session_state:
+    st.session_state["zip_items"] = []  # list of (filename, bytes)
+
+# Keyword input
+keywords_text = st.text_area("Paste keywords (one per line)", height=140,
+                             placeholder="Tavern on the Square, Vail Colorado\nBest seafood restaurant in Boston")
+
+col_a, col_b = st.columns([1, 1])
+if mode == "Real Photos":
+    if col_a.button("Collect candidates"):
+        st.session_state["realphoto_sets"] = {}
+        kws = [ln.strip() for ln in keywords_text.splitlines() if ln.strip()]
+        if not kws:
+            st.warning("Please paste at least one keyword.")
+        else:
+            if not gmaps_key:
+                st.error("Please enter your Google Maps/Places API key in the sidebar.")
+            else:
+                prog = st.progress(0.0)
+                for i, kw in enumerate(kws, start=1):
+                    st.session_state["realphoto_sets"][kw] = collect_real_photo_candidates(
+                        kw, use_places_flag, use_street_flag, use_serp_flag, sv_radius_m,
+                        gmaps_key, serp_key if use_serp_flag else None
+                    )
+                    prog.progress(i / len(kws))
+                st.success("Candidates collected. Scroll down and click **Create Image** on any thumbnail.")
+    if col_b.button("Clear"):
+        st.session_state["realphoto_sets"].clear()
+        st.session_state["zip_items"].clear()
+        st.success("Cleared.")
+
+    # Display candidates per keyword
+    sets = st.session_state.get("realphoto_sets", {})
+    for kw, cands in sets.items():
+        # Defensive filter: hide SerpAPI refs if toggle off
+        if not use_serp_flag:
+            cands = [c for c in cands if "SerpAPI" not in c.title]
+
+        st.markdown(f"### {kw}")
+        if not cands:
+            st.info("No candidates found yet. Try a different query or increase Street View radius.")
+            continue
+
+        cols = st.columns(3)
+        for idx, c in enumerate(cands):
+            with cols[idx % 3]:
+                st.image(c.preview_bytes, use_container_width=True, caption=c.title)
+                st.caption(c.license_note)
+                st.caption(f"Credit: {c.source}")
+
+                # Per-card Create button
+                fn = f"{slugify(kw)}_{idx}.webp"
+                if st.button("Create Image", key=f"create_{kw}_{idx}"):
+                    try:
+                        webp = to_webp_bytes(c.preview_bytes, OUTPUT_W, OUTPUT_H, quality)
+                        st.session_state["zip_items"].append((fn, webp))
+                        st.success(f"Created {fn}")
+                        st.download_button("Download", data=webp, file_name=fn, mime="image/webp",
+                                           key=f"dl_{kw}_{idx}")
+                        if make_pin:
+                            pin_fn = f"{slugify(kw)}_{idx}_pinterest.webp"
+                            pin_b = to_webp_bytes(c.preview_bytes, PINTEREST_W, PINTEREST_H, quality)
+                            st.session_state["zip_items"].append((pin_fn, pin_b))
+                            st.download_button("Download Pinterest", data=pin_b, file_name=pin_fn,
+                                               mime="image/webp", key=f"dlp_{kw}_{idx}")
+                    except Exception as e:
+                        st.error(f"Failed: {e}")
+
+    if st.session_state["zip_items"]:
+        import zipfile
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for fn, b in st.session_state["zip_items"]:
+                zf.writestr(fn, b)
+        buf.seek(0)
+        st.download_button("⬇️ Download all as ZIP", data=buf, file_name="imageforge_realphotos.zip",
+                           mime="application/zip")
+
 else:
-    size_choice = "1024x1024"
-
-col_run, col_clear = st.columns([1, 1])
-with col_run:
-    run = st.button("Generate image(s)", type="primary")
-with col_clear:
-    if st.button("Clear"):
+    # ----------------- AI Render mode -----------------
+    size = st.selectbox("OpenAI render size", OPENAI_IMAGE_SIZES, index=0)
+    if col_a.button("Generate Image"):  # one-shot per keyword list (with optional LSI)
+        if not openai_key:
+            st.error("Please enter your OpenAI API key in the sidebar.")
+        else:
+            kws = [ln.strip() for ln in keywords_text.splitlines() if ln.strip()]
+            if not kws:
+                st.warning("Please paste at least one keyword.")
+            else:
+                outputs: List[Tuple[str, bytes]] = []
+                prog = st.progress(0.0)
+                total = 0
+                for kw in kws:
+                    # LSI expansion (simple heuristic)
+                    variants = [kw]
+                    if images_per_keyword > 1 and lsi_method == "Heuristic":
+                        base = kw
+                        hints = [
+                            "at golden hour", "wide angle", "close-up details",
+                            "with people candidly present", "without people",
+                            "from a high vantage", "street-level perspective",
+                            "moody overcast light", "bright clear sky"
+                        ]
+                        # pick first N-1 hints deterministically
+                        for h in hints[:images_per_keyword - 1]:
+                            variants.append(f"{base} — {h}")
+                    for v in variants:
+                        try:
+                            prompt = build_ai_prompt(site, v)
+                            png = openai_generate_image_b64(prompt, size, openai_key)
+                            webp = to_webp_bytes(png, OUTPUT_W, OUTPUT_H, quality)
+                            fn = f"{slugify(v)}.webp"
+                            outputs.append((fn, webp))
+                            st.image(webp, caption=fn, use_container_width=True)
+                            st.download_button("Download", data=webp, file_name=fn,
+                                               mime="image/webp", key=f"dl_ai_{fn}")
+                            if make_pin:
+                                pin_fn = f"{slugify(v)}_pinterest.webp"
+                                pin_b = to_webp_bytes(png, PINTEREST_W, PINTEREST_H, quality)
+                                st.download_button("Download Pinterest", data=pin_b, file_name=pin_fn,
+                                                   mime="image/webp", key=f"dlp_ai_{pin_fn}")
+                        except Exception as e:
+                            st.error(f"{v}: {e}")
+                        total += 1
+                        prog.progress(min(1.0, total / max(1, (len(kws) * images_per_keyword))))
+                if outputs:
+                    import zipfile
+                    buf = io.BytesIO()
+                    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                        for fn, b in outputs:
+                            zf.writestr(fn, b)
+                    buf.seek(0)
+                    st.download_button("⬇️ Download all as ZIP", data=buf, file_name="imageforge_ai.zip",
+                                       mime="application/zip")
+    if col_b.button("Clear"):
         st.experimental_rerun()
-
-# --------------------------
-# Execution
-# --------------------------
-
-keywords = [k.strip() for k in (kw_text or "").splitlines() if k.strip()]
-
-if run and not keywords:
-    st.warning("Please add at least one keyword.")
-    st.stop()
-
-if run and mode == MODE_AI:
-    if not openai_key:
-        st.error("OpenAI API key is required for AI Render.")
-        st.stop()
-
-    for i, kw in enumerate(keywords, start=1):
-        st.markdown(f"### {i}/{len(keywords)} — {kw}")
-
-        # Build the prompt the same way as 1.3.2 (style hint based on site)
-        style_hint = {
-            "vailvacay.com": "mountain-town editorial, realistic, tasteful travel blog hero, correct season props",
-            "ipetzo.com": "pet-friendly, warm lifestyle, real locations, candid moments",
-            "bostonvacay.com": "New England urban vibe, historic + foodie, editorial realism",
-            "bangkokvacay.com": "Southeast Asia urban night/day vibe, authentic street scenes",
-        }.get(site_style, "")
-
-        prompt = f"{kw}. Style: {style_hint}".strip()
-
-        size_for_api = clamp_openai_size(size_choice)
-
-        img_bytes, err = openai_generate_image_bytes(
-            api_key=openai_key,
-            prompt=prompt,
-            size_str=size_for_api,
-        )
-        if err:
-            st.error(err)
-            continue
-
-        # Filename
-        safe = re.sub(r"[^a-z0-9\-]+", "-", kw.lower()).strip("-")
-        filename = f"{safe}.webp"
-        save_and_show(img_bytes, filename, webp_quality)
-
-elif run and mode == MODE_REAL:
-    if not gmaps_key:
-        st.error("Google Maps/Places API key is required for Real Photos.")
-        st.stop()
-
-    # NOTE: We keep the real-photo search logic identical in spirit to v1.3.2.
-    # This patch does not alter fetching/selection. For each keyword, fetch a photo
-    # via Places (first photo_reference found). Street View is optional.
-    for i, kw in enumerate(keywords, start=1):
-        st.markdown(f"### {i}/{len(keywords)} — {kw}")
-
-        # Find place by text search (simple one-pass; v1.3.2 behavior preserved)
-        try:
-            r = requests.get(
-                "https://maps.googleapis.com/maps/api/place/textsearch/json",
-                params={"query": kw, "key": gmaps_key},
-                timeout=30,
-            )
-            r.raise_for_status()
-            js = r.json()
-        except Exception as e:
-            st.error(f"Places search error: {e}")
-            continue
-
-        candidates = js.get("results", []) or []
-        if not candidates:
-            st.warning("No candidates found.")
-            continue
-
-        place = candidates[0]
-        place_id = place.get("place_id")
-
-        # Place Details to pull photos + geometry
-        try:
-            r2 = requests.get(
-                "https://maps.googleapis.com/maps/api/place/details/json",
-                params={"place_id": place_id, "key": gmaps_key, "fields": "photo,geometry,name"},
-                timeout=30,
-            )
-            r2.raise_for_status()
-            det = r2.json().get("result", {})
-        except Exception as e:
-            st.error(f"Place details error: {e}")
-            continue
-
-        used_any = False
-
-        # Places Photo
-        if use_places:
-            photos = (det.get("photos") or [])
-            if photos:
-                ref = photos[0].get("photo_reference")
-                ph = gmaps_photo_bytes(gmaps_key, ref, maxwidth=1600)
-                if ph:
-                    safe = re.sub(r"[^a-z0-9\-]+", "-", kw.lower()).strip("-")
-                    filename = f"{safe}.webp"
-                    save_and_show(ph, filename, webp_quality)
-                    used_any = True
-
-        # Street View
-        if use_street:
-            loc = (det.get("geometry") or {}).get("location") or {}
-            lat, lng = loc.get("lat"), loc.get("lng")
-            if lat is not None and lng is not None:
-                sv = street_view_bytes(gmaps_key, lat, lng, width=1600, height=900)
-                if sv:
-                    safe = re.sub(r"[^a-z0-9\-]+", "-", kw.lower()).strip("-")
-                    filename = f"{safe}-streetview.webp"
-                    save_and_show(sv, filename, webp_quality)
-                    used_any = True
-
-        if not used_any:
-            st.info("No usable real photo found for this keyword.")
-
-# Footer
-st.caption("ImageForge v1.3.3 — hotfix for AI Render (response_format & URL fallback).")
