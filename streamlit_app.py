@@ -1,16 +1,11 @@
-# ImageForge v1.3 — Real Photos + AI Render (fixed SerpAPI filtering, per-card Create Image)
+# ImageForge v1.4 — Real Photos + AI Render + Batch from Excel
 # ------------------------------------------------------------
-# Requirements: streamlit, requests, pillow
-#   pip install streamlit requests pillow
+# Requirements: streamlit, requests, pillow, pandas, openpyxl
+#   pip install streamlit requests pillow pandas openpyxl
 #
-# IMPORTANT: Enable these Google APIs on your project if using Real Photos mode:
+# IMPORTANT: Enable these Google APIs if using Real Photos mode:
 #   • Places API (or Places API (New))
 #   • Street View Static API
-#
-# Notes:
-# - SerpAPI is optional and strictly off unless the box is checked.
-# - We never persist or prefill API keys.
-# - OpenAI image call has a retry path that removes 'response_format' if the API rejects it.
 
 from __future__ import annotations
 
@@ -25,15 +20,13 @@ from typing import List, Optional, Tuple
 import requests
 from PIL import Image, ImageOps
 import streamlit as st
-# Read keys from Streamlit Secrets (if provided)
-SECRETS = st.secrets.get("api_keys", {})
-
+import pandas as pd
 
 # -----------------------------
 # App constants & helpers
 # -----------------------------
 
-APP_NAME = "ImageForge v1.3"
+APP_NAME = "ImageForge v1.4"
 OUTPUT_W, OUTPUT_H = 1200, 675
 PINTEREST_W, PINTEREST_H = 1000, 1500
 OPENAI_IMAGE_SIZES = ("1536x1024", "1024x1536", "1024x1024")
@@ -47,6 +40,8 @@ SITE_PROFILES = {
 }
 DEFAULT_SITE = "vailvacay.com"
 
+# Read keys from Streamlit Secrets (if provided)
+SECRETS = st.secrets.get("api_keys", {})
 
 @dataclass
 class Candidate:
@@ -55,16 +50,13 @@ class Candidate:
     preview_bytes: bytes
     license_note: str
 
-
 def slugify(text: str) -> str:
     t = text.lower().strip()
     t = re.sub(r"[’'`]", "", t)
     t = re.sub(r"[^a-z0-9]+", "-", t).strip("-")
     return t
 
-
 def crop_resize_to(img: Image.Image, w: int, h: int) -> Image.Image:
-    # letter-safe crop to aspect, then resize
     t_ratio = w / h
     iw, ih = img.size
     if iw / ih > t_ratio:
@@ -77,14 +69,12 @@ def crop_resize_to(img: Image.Image, w: int, h: int) -> Image.Image:
         box = (0, y0, iw, y0 + new_h)
     return img.crop(box).resize((w, h), Image.LANCZOS)
 
-
 def to_webp_bytes(img_bytes: bytes, w: int, h: int, quality: int) -> bytes:
     img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
     img = crop_resize_to(img, w, h)
     buf = io.BytesIO()
     img.save(buf, "WEBP", quality=max(60, min(95, quality)), method=6)
     return buf.getvalue()
-
 
 # -----------------------------
 # Google / SerpAPI fetchers
@@ -98,7 +88,6 @@ def google_textsearch_place(query: str, gmaps_key: str) -> Optional[dict]:
     data = r.json()
     return (data.get("results") or [None])[0]
 
-
 def google_place_details(place_id: str, gmaps_key: str) -> dict:
     url = "https://maps.googleapis.com/maps/api/place/details/json"
     r = requests.get(url, params={
@@ -108,27 +97,21 @@ def google_place_details(place_id: str, gmaps_key: str) -> dict:
     }, timeout=30)
     return (r.json() or {}).get("result", {}) if r.status_code == 200 else {}
 
-
 def google_photo_bytes(photo_ref: str, gmaps_key: str, max_w: int = 1600) -> Optional[bytes]:
     url = "https://maps.googleapis.com/maps/api/place/photo"
-    # We must follow redirect to the actual image URL
     r = requests.get(url, params={"photoreference": photo_ref, "maxwidth": max_w, "key": gmaps_key},
                      timeout=30, allow_redirects=False)
-    # Sometimes Google returns a 302 with Location
     loc = r.headers.get("Location")
     if loc:
         img = requests.get(loc, timeout=30)
         if img.status_code == 200:
             return img.content
-    # fallback if direct
     if r.status_code == 200 and r.content:
         return r.content
     return None
 
-
 def streetview_bytes(lat: float, lng: float, gmaps_key: str, radius_m: int = 250,
                      size_w: int = 1024, size_h: int = 1024) -> Optional[bytes]:
-    # Try metadata first to confirm panorama availability
     meta = requests.get(
         "https://maps.googleapis.com/maps/api/streetview/metadata",
         params={"location": f"{lat},{lng}", "radius": radius_m, "key": gmaps_key},
@@ -138,7 +121,6 @@ def streetview_bytes(lat: float, lng: float, gmaps_key: str, radius_m: int = 250
         return None
     if meta.get("status") == "ZERO_RESULTS":
         return None
-    # Now fetch the image
     r = requests.get(
         "https://maps.googleapis.com/maps/api/streetview",
         params={"location": f"{lat},{lng}", "radius": radius_m,
@@ -149,18 +131,11 @@ def streetview_bytes(lat: float, lng: float, gmaps_key: str, radius_m: int = 250
         return r.content
     return None
 
-
 def serpapi_images(query: str, serp_key: str, num: int = 4) -> List[Tuple[str, str]]:
-    """Return list of (source, image_url). Reference-only."""
     try:
         r = requests.get(
             "https://serpapi.com/search.json",
-            params={
-                "engine": "google",
-                "q": query,
-                "tbm": "isch",
-                "api_key": serp_key
-            },
+            params={"engine": "google", "q": query, "tbm": "isch", "api_key": serp_key},
             timeout=30
         )
         if r.status_code != 200:
@@ -176,19 +151,16 @@ def serpapi_images(query: str, serp_key: str, num: int = 4) -> List[Tuple[str, s
     except Exception:
         return []
 
-
 # -----------------------------
-# OpenAI image generation (robust)
+# OpenAI image generation
 # -----------------------------
 
 def openai_generate_image_b64(prompt: str, size: str, api_key: str) -> bytes:
-    """Return PNG bytes from OpenAI. Retry without 'response_format' if rejected."""
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     payload = {"model": "gpt-image-1", "prompt": prompt, "size": size, "response_format": "b64_json"}
     url = "https://api.openai.com/v1/images/generations"
     r = requests.post(url, headers=headers, json=payload, timeout=120)
     if r.status_code == 400 and "response_format" in (r.text or ""):
-        # Retry without response_format for older gateways
         payload.pop("response_format", None)
         r = requests.post(url, headers=headers, json=payload, timeout=120)
     if r.status_code != 200:
@@ -198,20 +170,17 @@ def openai_generate_image_b64(prompt: str, size: str, api_key: str) -> bytes:
         b64 = jd["data"][0].get("b64_json")
         if b64:
             return base64.b64decode(b64)
-        # Fallback: some gateways return URL only
-        url = jd["data"][0].get("url")
-        if url:
-            img = requests.get(url, timeout=60)
+        url2 = jd["data"][0].get("url")
+        if url2:
+            img = requests.get(url2, timeout=60)
             if img.status_code == 200:
                 return img.content
     raise RuntimeError("OpenAI returned no image data.")
-
 
 def build_ai_prompt(site: str, keyword: str) -> str:
     base = SITE_PROFILES.get(site, SITE_PROFILES[DEFAULT_SITE])
     k = keyword.lower()
     style_hints = []
-    # a few light heuristics
     if any(x in k for x in ["ski", "snow", "back bowl", "vail in january", "winter"]):
         style_hints.append("winter setting; snow present where appropriate")
     if any(x in k for x in ["summer", "july", "august"]):
@@ -222,7 +191,6 @@ def build_ai_prompt(site: str, keyword: str) -> str:
     return (f"{base} Create a photorealistic landscape-orientation image for: '{keyword}'. "
             f"Balanced composition; natural light; editorial stock-photo feel; "
             f"no text or logos; no brand marks. Scene intent: {style}.")
-
 
 # -----------------------------
 # Real-photo candidate collector
@@ -280,7 +248,7 @@ def collect_real_photo_candidates(q: str,
         except Exception:
             pass
 
-    # SerpAPI (reference-only) — strictly obey toggle
+    # SerpAPI (reference-only)
     if use_serp_flag and serp_key:
         refs = serpapi_images(q, serp_key, num=6)
         for src, url in refs:
@@ -298,45 +266,31 @@ def collect_real_photo_candidates(q: str,
 
     return cands
 
-
 # -----------------------------
 # UI
 # -----------------------------
 
 st.set_page_config(page_title=APP_NAME, layout="wide")
-st.title(f"{APP_NAME} — Real Photos + AI Render")
+st.title(f"{APP_NAME} — Real Photos + AI Render + Excel Batch")
 
 # Mode
-mode = st.sidebar.radio("Mode", ["Real Photos", "AI Render"], index=0)
+mode = st.sidebar.radio("Mode", ["Real Photos", "AI Render", "Batch from Excel"], index=0)
 
-# Keys
+# Keys (with Secrets fallback)
 st.sidebar.subheader("Keys")
-
-# Users can paste keys; if left blank, we fall back to Secrets.
 gmaps_key_input = st.sidebar.text_input("Google Maps/Places API key", type="password")
 serp_key_input  = st.sidebar.text_input("SerpAPI key (optional)", type="password")
 openai_key_input = st.sidebar.text_input("OpenAI API key (for AI Render)", type="password")
-
-# Fallback to secrets if inputs are empty (no prefilling, just runtime defaulting)
 gmaps_key  = gmaps_key_input  or SECRETS.get("GOOGLE_MAPS_API_KEY", "")
 serp_key   = serp_key_input   or SECRETS.get("SERPAPI_KEY", "")
 openai_key = openai_key_input or SECRETS.get("OPENAI_API_KEY", "")
-
-# Optional tiny hint (does not reveal keys)
-with st.sidebar.expander("Key source (info)", expanded=False):
-    st.write(
-        f"Google Maps/Places: {'Secrets' if not gmaps_key_input and gmaps_key else 'Sidebar'}\n"
-        f"SerpAPI: {'Secrets' if not serp_key_input and serp_key else 'Sidebar/Empty'}\n"
-        f"OpenAI: {'Secrets' if not openai_key_input and openai_key else 'Sidebar/Empty'}"
-    )
-
 
 # Output
 st.sidebar.subheader("Output")
 quality = st.sidebar.slider("WebP quality", 60, 95, 82)
 make_pin = st.sidebar.checkbox("Also make a Pinterest image (1000×1500)")
 
-# Site style
+# AI settings
 st.sidebar.subheader("AI settings")
 site = st.sidebar.selectbox("Site style", list(SITE_PROFILES.keys()),
                             index=list(SITE_PROFILES.keys()).index(DEFAULT_SITE))
@@ -368,11 +322,15 @@ if "realphoto_sets" not in st.session_state:
 if "zip_items" not in st.session_state:
     st.session_state["zip_items"] = []  # list of (filename, bytes)
 
-# Keyword input
-keywords_text = st.text_area("Paste keywords (one per line)", height=140,
-                             placeholder="Tavern on the Square, Vail Colorado\nBest seafood restaurant in Boston")
+# -----------------------------
+# Keyword input or Excel upload
+# -----------------------------
 
-col_a, col_b = st.columns([1, 1])
+if mode in ("Real Photos", "AI Render"):
+    keywords_text = st.text_area("Paste keywords (one per line)", height=140,
+                                 placeholder="Tavern on the Square, Vail Colorado\nBest seafood restaurant in Boston")
+    col_a, col_b = st.columns([1, 1])
+
 if mode == "Real Photos":
     if col_a.button("Collect candidates"):
         st.session_state["realphoto_sets"] = {}
@@ -396,10 +354,8 @@ if mode == "Real Photos":
         st.session_state["zip_items"].clear()
         st.success("Cleared.")
 
-    # Display candidates per keyword
     sets = st.session_state.get("realphoto_sets", {})
     for kw, cands in sets.items():
-        # Defensive filter: hide SerpAPI refs if toggle off
         if not use_serp_flag:
             cands = [c for c in cands if "SerpAPI" not in c.title]
 
@@ -415,7 +371,6 @@ if mode == "Real Photos":
                 st.caption(c.license_note)
                 st.caption(f"Credit: {c.source}")
 
-                # Per-card Create button
                 fn = f"{slugify(kw)}_{idx}.webp"
                 if st.button("Create Image", key=f"create_{kw}_{idx}"):
                     try:
@@ -443,10 +398,9 @@ if mode == "Real Photos":
         st.download_button("⬇️ Download all as ZIP", data=buf, file_name="imageforge_realphotos.zip",
                            mime="application/zip")
 
-else:
-    # ----------------- AI Render mode -----------------
+elif mode == "AI Render":
     size = st.selectbox("OpenAI render size", OPENAI_IMAGE_SIZES, index=0)
-    if col_a.button("Generate Image"):  # one-shot per keyword list (with optional LSI)
+    if col_a.button("Generate Image"):
         if not openai_key:
             st.error("Please enter your OpenAI API key in the sidebar.")
         else:
@@ -458,7 +412,6 @@ else:
                 prog = st.progress(0.0)
                 total = 0
                 for kw in kws:
-                    # LSI expansion (simple heuristic)
                     variants = [kw]
                     if images_per_keyword > 1 and lsi_method == "Heuristic":
                         base = kw
@@ -468,7 +421,6 @@ else:
                             "from a high vantage", "street-level perspective",
                             "moody overcast light", "bright clear sky"
                         ]
-                        # pick first N-1 hints deterministically
                         for h in hints[:images_per_keyword - 1]:
                             variants.append(f"{base} — {h}")
                     for v in variants:
@@ -501,3 +453,100 @@ else:
                                        mime="application/zip")
     if col_b.button("Clear"):
         st.experimental_rerun()
+
+# -----------------------------
+# New: Batch from Excel
+# -----------------------------
+else:
+    st.markdown("### Upload an Excel file with business names")
+    st.write("Accepted: `.xlsx` (first row as headers). Common header names: **name**, **business**, **place**, or choose any column below.")
+
+    file = st.file_uploader("Upload Excel (.xlsx)", type=["xlsx"])
+    if file:
+        try:
+            df = pd.read_excel(file)
+        except Exception as e:
+            st.error(f"Unable to read Excel: {e}")
+            st.stop()
+
+        if df.empty:
+            st.warning("The spreadsheet is empty.")
+            st.stop()
+
+        # Pick a column for queries
+        default_col = None
+        for c in df.columns:
+            if str(c).strip().lower() in ("name", "business", "place", "query", "keyword"):
+                default_col = c
+                break
+        column = st.selectbox("Select the column that contains business names/queries:", list(df.columns),
+                              index=(list(df.columns).index(default_col) if default_col in df.columns else 0))
+
+        # Optional: city/state context to improve disambiguation
+        context_hint = st.text_input("Optional location/context to append to each query (e.g., 'Vail, Colorado')", "")
+
+        # Batch options
+        col1, col2 = st.columns(2)
+        max_places_photos = col1.number_input("Max Places Photos to try per business", 1, 12, 6)
+        use_street_in_batch = col2.checkbox("Also try Street View if no Places Photo", value=True)
+
+        start = st.button("Run batch (Create images + ZIP)")
+        if start:
+            if not gmaps_key:
+                st.error("Google Maps/Places API key is required (enter in sidebar).")
+                st.stop()
+
+            import zipfile
+            zip_buf = io.BytesIO()
+            created = 0
+            prog = st.progress(0.0)
+
+            with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                rows = df[column].astype(str).tolist()
+                total = len(rows)
+                for i, raw in enumerate(rows, start=1):
+                    q = raw.strip()
+                    if not q:
+                        prog.progress(i/total); continue
+                    if context_hint:
+                        q = f"{q}, {context_hint}"
+
+                    # Collect candidates (limit Places photos in this batch)
+                    cands = collect_real_photo_candidates(
+                        q,
+                        use_places_flag=True,
+                        use_street_flag=use_street_in_batch,
+                        use_serp_flag=False,             # keep Serp off in batch
+                        sv_radius_m=sv_radius_m,
+                        gmaps_key=gmaps_key,
+                        serp_key=None
+                    )
+
+                    # Prefer Places Photo; fall back to Street View
+                    chosen = None
+                    places = [c for c in cands if "Places Photo" in c.title]
+                    street = [c for c in cands if "Street View" in c.title]
+                    pool = (places[:max_places_photos] or street[:1])
+
+                    if pool:
+                        chosen = pool[0]
+
+                    if chosen:
+                        try:
+                            webp = to_webp_bytes(chosen.preview_bytes, OUTPUT_W, OUTPUT_H, quality)
+                            base = slugify(raw)
+                            fn = f"{base or 'image'}_{i}.webp"
+                            zf.writestr(fn, webp)
+                            created += 1
+                            if make_pin:
+                                pin_b = to_webp_bytes(chosen.preview_bytes, PINTEREST_W, PINTEREST_H, quality)
+                                zf.writestr(f"{base or 'image'}_{i}_pinterest.webp", pin_b)
+                        except Exception as e:
+                            st.write(f"⚠️ {raw}: {e}")
+
+                    prog.progress(i/total)
+
+            zip_buf.seek(0)
+            st.success(f"Done. Created {created} images.")
+            st.download_button("⬇️ Download batch as ZIP", data=zip_buf,
+                               file_name="imageforge_batch.zip", mime="application/zip")
