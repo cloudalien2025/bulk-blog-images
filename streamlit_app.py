@@ -25,6 +25,8 @@ from typing import List, Optional, Tuple
 import requests
 from PIL import Image, ImageOps
 import streamlit as st
+# Read keys from Streamlit Secrets (if provided)
+SECRETS = st.secrets.get("api_keys", {})
 
 
 # -----------------------------
@@ -309,9 +311,25 @@ mode = st.sidebar.radio("Mode", ["Real Photos", "AI Render"], index=0)
 
 # Keys
 st.sidebar.subheader("Keys")
-gmaps_key = st.sidebar.text_input("Google Maps/Places API key", type="password")
-serp_key = st.sidebar.text_input("SerpAPI key (optional)", type="password")
-openai_key = st.sidebar.text_input("OpenAI API key (for AI Render)", type="password")
+
+# Users can paste keys; if left blank, we fall back to Secrets.
+gmaps_key_input = st.sidebar.text_input("Google Maps/Places API key", type="password")
+serp_key_input  = st.sidebar.text_input("SerpAPI key (optional)", type="password")
+openai_key_input = st.sidebar.text_input("OpenAI API key (for AI Render)", type="password")
+
+# Fallback to secrets if inputs are empty (no prefilling, just runtime defaulting)
+gmaps_key  = gmaps_key_input  or SECRETS.get("GOOGLE_MAPS_API_KEY", "")
+serp_key   = serp_key_input   or SECRETS.get("SERPAPI_KEY", "")
+openai_key = openai_key_input or SECRETS.get("OPENAI_API_KEY", "")
+
+# Optional tiny hint (does not reveal keys)
+with st.sidebar.expander("Key source (info)", expanded=False):
+    st.write(
+        f"Google Maps/Places: {'Secrets' if not gmaps_key_input and gmaps_key else 'Sidebar'}\n"
+        f"SerpAPI: {'Secrets' if not serp_key_input and serp_key else 'Sidebar/Empty'}\n"
+        f"OpenAI: {'Secrets' if not openai_key_input and openai_key else 'Sidebar/Empty'}"
+    )
+
 
 # Output
 st.sidebar.subheader("Output")
