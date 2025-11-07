@@ -76,6 +76,25 @@ def to_webp_bytes(img_bytes: bytes, w: int, h: int, quality: int) -> bytes:
     img.save(buf, "WEBP", quality=max(60, min(95, quality)), method=6)
     return buf.getvalue()
 
+# NEW: helper to build a per-keyword ZIP
+def build_keyword_zip(kw: str, cands: List[Candidate], quality: int, make_pin: bool) -> io.BytesIO:
+    import zipfile
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for idx, c in enumerate(cands):
+            try:
+                webp = to_webp_bytes(c.preview_bytes, OUTPUT_W, OUTPUT_H, quality)
+                base = f"{slugify(kw)}_{idx}"
+                zf.writestr(f"{base}.webp", webp)
+                if make_pin:
+                    pin_b = to_webp_bytes(c.preview_bytes, PINTEREST_W, PINTEREST_H, quality)
+                    zf.writestr(f"{base}_pinterest.webp", pin_b)
+            except Exception:
+                # skip bad candidate silently
+                pass
+    buf.seek(0)
+    return buf
+
 # -----------------------------
 # Google / SerpAPI fetchers
 # -----------------------------
@@ -321,6 +340,9 @@ if "realphoto_sets" not in st.session_state:
     st.session_state["realphoto_sets"] = {}
 if "zip_items" not in st.session_state:
     st.session_state["zip_items"] = []  # list of (filename, bytes)
+# NEW: per-keyword zip cache
+if "per_kw_zip" not in st.session_state:
+    st.session_state["per_kw_zip"] = {}  # dict: {keyword -> bytes}
 
 # -----------------------------
 # Keyword input or Excel upload
@@ -352,20 +374,60 @@ if mode == "Real Photos":
     if col_b.button("Clear"):
         st.session_state["realphoto_sets"].clear()
         st.session_state["zip_items"].clear()
+        st.session_state["per_kw_zip"].clear()
         st.success("Cleared.")
 
     sets = st.session_state.get("realphoto_sets", {})
     for kw, cands in sets.items():
-        if not use_serp_flag:
-            cands = [c for c in cands if "SerpAPI" not in c.title]
-
         st.markdown(f"### {kw}")
-        if not cands:
+
+        # Optionally filter out SerpAPI images if that source is off
+        display_cands = cands if use_serp_flag else [c for c in cands if "SerpAPI" not in c.title]
+
+        # NEW: per-keyword actions row
+        btn1, btn2, btn3 = st.columns([1, 1, 2])
+
+        with btn1:
+            if st.button("Create All (add to cart)", key=f"mkall_{kw}"):
+                added = 0
+                for idx, c in enumerate(display_cands):
+                    try:
+                        webp = to_webp_bytes(c.preview_bytes, OUTPUT_W, OUTPUT_H, quality)
+                        st.session_state["zip_items"].append((f"{slugify(kw)}_{idx}.webp", webp))
+                        added += 1
+                        if make_pin:
+                            pin = to_webp_bytes(c.preview_bytes, PINTEREST_W, PINTEREST_H, quality)
+                            st.session_state["zip_items"].append((f"{slugify(kw)}_{idx}_pinterest.webp", pin))
+                    except Exception as e:
+                        st.warning(f"{kw} #{idx}: {e}")
+                st.success(f"Added {added} images to cart for '{kw}'.")
+
+        with btn2:
+            if st.button("Create ZIP (this keyword)", key=f"mkzip_{kw}"):
+                if display_cands:
+                    buf = build_keyword_zip(kw, display_cands, quality, make_pin)
+                    st.session_state["per_kw_zip"][kw] = buf.getvalue()
+                    st.success(f"ZIP prepared for '{kw}'. See download button →")
+                else:
+                    st.info("No candidates to include.")
+
+        with btn3:
+            if kw in st.session_state["per_kw_zip"]:
+                st.download_button(
+                    "⬇️ Download ZIP for this keyword",
+                    data=st.session_state["per_kw_zip"][kw],
+                    file_name=f"{slugify(kw)}.zip",
+                    mime="application/zip",
+                    key=f"dlzip_{kw}"
+                )
+
+        # Thumbnails grid
+        if not display_cands:
             st.info("No candidates found yet. Try a different query or increase Street View radius.")
             continue
 
         cols = st.columns(3)
-        for idx, c in enumerate(cands):
+        for idx, c in enumerate(display_cands):
             with cols[idx % 3]:
                 st.image(c.preview_bytes, use_container_width=True, caption=c.title)
                 st.caption(c.license_note)
@@ -388,6 +450,7 @@ if mode == "Real Photos":
                     except Exception as e:
                         st.error(f"Failed: {e}")
 
+    # Global ZIP for everything added to cart
     if st.session_state["zip_items"]:
         import zipfile
         buf = io.BytesIO()
